@@ -27,6 +27,23 @@ description: "The patterns that keep 450 files navigable: errors, types, exports
 - Fixture dirs use `mkdtemp` — never write into the repo from tests.
 - `*.live.test.ts` guards on env keys; `*.replay.test.ts` replays cassettes; `*.test-d.ts` asserts types.
 
+## Design documents
+
+New `design/*.mdx` pages follow the technical-design template — this is the baseline every ADR-style page extends:
+
+```mdx
+# Entry Point          — where the feature lives (files, symbols, API surface)
+# Background           — ## Rationale, ## Problem Statement, ## Business Value
+# Goal                 — ### Primary Goal (SMART), ### Secondary Goals
+# Scope                — ## This project is for / ## This project is not for
+# Solution             — the design in detail, system design where applicable
+# Other Solutions      — rejected alternatives + why; ## Challenges
+# Implementation considerations — monitoring, environments, security, perf
+## Example / ## Where next — working snippet + cross-links (extension)
+```
+
+Keep the six template sections even when a section is short — the uniformity is what makes the ADRs scannable.
+
 ## Docs and exports
 
 - `docs/*.md` is the source of truth; `E:\agent-sdk-docs` renders it via `scripts/sync-sdk-docs.mjs` (add your page to its `PAGES` map and `docs.json` nav).

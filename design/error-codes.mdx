@@ -1,52 +1,79 @@
 ---
 title: "Stable error codes"
-description: "Why every SDK error carries a LOUSHO_* code, a one-sentence hint and a docs link — and why model-facing errors hide them."
+description: "Technical design: every SDK error carries a LOUSHO_* code, a one-sentence hint and a docs link — and why model-facing errors hide them."
 ---
 
-## The decision
+# Entry Point
 
-Every error the SDK throws on purpose is an `SDKError` carrying a stable `code` (`LOUSHO_<AREA>_<NAME>`) from the `ERROR_CODES` registry in `src/utils/errorCodes.ts`. Each code maps to a one-sentence fix `hint` and a `docs` link into `docs/errors.md#<code>`; the `message` ends with a `[code] hint (docs)` line so an uncaught error tells the reader what to do. Callers branch on `error.code`, never on message text — messages are free to get clearer without breaking anyone.
+`SDKError` (`src/utils/sdkError.ts`) — the class every intentional SDK throw uses — and the `ERROR_CODES` registry (`src/utils/errorCodes.ts`), the single source of truth mapping each `LOUSHO_<AREA>_<NAME>` code to a fix `hint` and a `docs` link into `docs/errors.md#<code>`. The subclass layer lives in `src/execution/errors.ts` (`AgentExecutionError`, `ToolExecutionError`, `SessionAwaitingApprovalError`, …). Consumers see the surface as `error.code` / `error.hint` / `error.detail` and branch on `code`.
 
-## Alternatives rejected
+# Background
 
-- **Subclass-only taxonomy.** "Catch `ConfigurationError`" tells you *where* something failed, not *what to do* — `LOUSHO_CONFIG_MISSING_PROVIDER` vs `LOUSHO_CONFIG_INVALID` need different fixes from the same class. Codes carry the actionable bit; subclasses remain for fields (`MissingPeerDependencyError.installCommand`, `SessionAwaitingApprovalError.approvalId`).
-- **Message matching.** The explicit anti-goal: docs/errors.md tells consumers to branch on `code` precisely because text may change.
-- **Plain `new Error(...)`.** A test (`src/utils/plainErrors.test.ts`) fails when new SDK code throws a literal `Error` without a code; the few grandfathered sites are listed there with reasons. A handful of named subclasses stay code-free on purpose — `PropagatingToolError` (control flow), `WorkspaceError`/`McpToolError` (already tool results), `AuthError` (a 401/403, not a fixable SDK condition), `CronExpressionError`, `DecryptionError`.
-- **Enum/numeric codes.** String codes are greppable across `src/`, docs and user bug reports; they also survive serialization into events and logs.
+## Rationale
 
-## Where it shows up
+An uncaught error is the SDK's most-read interface — it's what every user sees first when something breaks. A bare stack trace wastes that moment; a coded error converts it into "here's exactly what to fix".
 
-- `src/utils/errorCodes.ts` — the `ERROR_CODES` registry (single source of truth), `errorDocsUrl`, `errorHelp`. A test keeps registry ↔ codes used in `src/` ↔ `docs/errors.md` sections in sync — adding a throw means adding a code, a hint and a docs section.
-- `src/utils/sdkError.ts` — `SDKError` itself. It lives in `utils`, not `execution/errors.ts`, so browser entries can throw it without pulling in the `ai` peer. `error.detail` is the message without the help line.
-- `src/execution/errors.ts` — the subclass layer (`AgentExecutionError`, `ToolExecutionError`, `SessionAwaitingApprovalError`, …) plus `compactProviderError`, which reduces any provider failure to the five-category `CompactedProviderError` — deliberately the same `{error: string}` family as tool-error results so the model sees one shape (LOU-T4).
-- `appendHelp: false` — `ToolExecutionError`, `LLMProviderError`, `TimeoutError`, `RateLimitError` keep `message` bare because it is handed to the model as a tool result or compacted provider error; a docs URL would burn tokens and confuse it. `toString()` still prints the line, and `code`/`hint`/`docs` are still there for the caller.
-- `instanceof` works across duplicated SDK copies via the `Symbol.for('lousho.SDKError')` brand — see [branded types](/design/branded-types).
+## Problem Statement
 
-## Trade-offs accepted
+Consumers need to *handle* failures programmatically (branch on what went wrong) while humans need to *fix* them (what to do). Message text can't serve either reliably — it improves over time, and "improves" means "changes", which breaks anyone matching on it.
 
-- The registry is a gate on every new error path: a contributor can't `throw` without picking a code, writing a hint and updating `docs/errors.md`.
-- Codes are forever — renaming one breaks consumers' `catch` blocks, so names are chosen carefully (e.g. `LOUSHO_OUTPUT_INVALID` is reserved even though the condition reports as a `finishReason`, not a throw).
-- `appendHelp: false` means a model-facing `message` and the human-facing `toString()` differ; code that logs `error.message` on tool errors shows less than code that logs `String(error)`.
+## Business Value
+
+Lower support burden and better DX: every thrown error self-documents its fix and a docs link. Greppable string codes let bug reports and logs correlate to a single stable identifier across versions.
+
+# Goal
+
+### Primary Goal
+
+Every SDK-thrown error carries a stable `code` + one-sentence `hint` + docs link; consumers branch on `code`, never on message text; a registry↔source↔docs sync test makes adding a throw without a code impossible.
+
+### Secondary Goals
+
+- Model-facing errors stay terse (`appendHelp: false` strips the hint line from `message` while `toString()` keeps it for humans).
+- `instanceof SDKError` holds across duplicated CJS/ESM copies via the `Symbol.for` brand ([branded types](/design/branded-types)).
+
+# Scope
+
+## This project is for
+
+- Errors the SDK throws on purpose, including the `compactProviderError` five-category reduction (same `{error: string}` family as tool-error results so the model sees one shape, LOU-T4).
+
+## This project is not for
+
+- Errors that are already structured results — `PropagatingToolError` (control flow), `WorkspaceError`/`McpToolError` (tool results), `AuthError` (a 401/403, not a fixable SDK condition), `CronExpressionError`, `DecryptionError` stay code-free on purpose.
+
+# Solution
+
+Each `SDKError` carries `code`; the registry maps code → `{ hint, docs }`; `message` ends with `[code] hint (docs)` unless `appendHelp: false`. `error.detail` exposes the message without the help line. `src/utils/plainErrors.test.ts` fails if new SDK code throws a literal `Error` — the few grandfathered sites are listed there with reasons. `SDKError` lives in `utils` (not `execution/errors.ts`) so browser entries can throw it without pulling the `ai` peer.
+
+# Other Solutions
+
+- **Subclass-only taxonomy** — rejected: "catch `ConfigurationError`" says *where*, not *what to do*; `LOUSHO_CONFIG_MISSING_PROVIDER` vs `LOUSHO_CONFIG_INVALID` need different fixes from the same class. Subclasses remain for fields (`MissingPeerDependencyError.installCommand`).
+- **Message matching** — the explicit anti-goal; docs tell consumers to branch on `code` because text may change.
+- **Enum/numeric codes** — rejected: string codes are greppable and survive serialization into events and logs.
+
+## Challenges
+
+- Codes are forever: renaming one breaks consumers' `catch` blocks — names are chosen carefully (`LOUSHO_OUTPUT_INVALID` is reserved even though it reports as a `finishReason`, not a throw).
+- `appendHelp: false` splits the surface: `error.message` (model-facing, bare) vs `String(error)` (human-facing, with hint) — logging the former shows less than the latter.
+
+# Implementation considerations
+
+- **Every new throw is a three-part change**: pick a code, write a hint, add a `docs/errors.md` section — the sync test enforces all three.
+- **When adding errors meant for the model** (tool/provider failures), pass `appendHelp: false` so `message` stays token-clean.
+- **Serialization**: codes survive into events/logs/traces where the Error object itself doesn't.
 
 ## Example
 
 ```text
-ConfigurationError: createAgent: no model configured. Do one of the following: (1) pass a model: ...
-[LOUSHO_CONFIG_MISSING_PROVIDER] Pass a model string such as createAgent({ model: 'openai/gpt-4o-mini' }), a provider instance, or set LOUSHO_MODEL or a provider API key. (https://github.com/LinuxDevil/agent-sdk/blob/main/docs/errors.md#lousho_config_missing_provider)
-```
-
-```ts
-try {
-  await agent.send('hi', { sessionId });
-} catch (error) {
-  if (error instanceof SDKError && error.code === 'LOUSHO_SESSION_AWAITING_APPROVAL') {
-    console.error(error.hint); // "Resolve the pending approval first ..."
-  }
-}
+ConfigurationError: createAgent: no model configured. Do one of the following: ...
+[LOUSHO_CONFIG_MISSING_PROVIDER] Pass a model string such as
+createAgent({ model: 'openai/gpt-4o-mini' }), a provider instance, or set
+LOUSHO_MODEL or a provider API key. (…/docs/errors.md#lousho_config_missing_provider)
 ```
 
 ## Where next
 
-- [Errors](/core/errors) — the error classes, compaction categories and what propagates where.
-- [Approvals](/core/approvals) — `SessionAwaitingApprovalError` in context.
-- [Docs pipeline](/quality/docs-pipeline) — the sync tests that enforce the registry.
+- [Errors](/core/errors) — the classes, compaction categories, propagation
+- [Branded types](/design/branded-types) — the cross-copy `instanceof` mechanism
+- [Docs pipeline](/quality/docs-pipeline) — the registry sync tests

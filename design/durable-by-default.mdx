@@ -1,56 +1,88 @@
 ---
 title: "Durable by default"
-description: "Why sessions, checkpoints and approvals are store-backed from day one — and what that costs the codebase."
+description: "Technical design: sessions, checkpoints and approvals are store-backed from day one — why, and what it costs the codebase."
 ---
 
-## The decision
+# Entry Point
 
-State that outlives a single call is written to a pluggable store, not kept in memory: session transcripts behind `SessionStore`, run progress behind `CheckpointStore`, paused approvals behind `ApprovalStore`, OAuth tokens behind `OAuthTokenStore` — bundled as one `AgentStore` option on `createAgent({ store })` (`src/storage/agentStore.ts`). A checkpoint is written after every model response that asks for tools, after every recorded tool result, on abort, on pause and on finish (`src/execution/checkpoint.ts`), so a crashed or interrupted run resumes from its last committed step — in the same process or another one, days later.
+The `store` option on `createAgent({ store })` — one `AgentStore` (`src/storage/agentStore.ts`) bundling four contracts: `SessionStore` for transcripts, `CheckpointStore` for run progress, `ApprovalStore` for paused approvals, `OAuthTokenStore` for tokens. Implementations: `memoryStore()` (default), `fileStore()`, `SqliteStore` (`src/storage/`), `KVStore`/`kvCheckpointStore` for Workers (`src/deploy/`). Inside a run, `src/execution/checkpoint.ts` writes a `Checkpoint` after every tool-requesting model response, after every tool result, and on abort/pause/finish. Resume entry: `agent.resume(sessionId)` → `src/execution/resume.ts` → `resumeAfterApproval()`.
 
-## Alternatives rejected
+# Background
 
-- **In-memory runs, persistence as a bolt-on.** A human approval can legitimately take days; an in-memory pause dies with the process and silently turns "waiting for approval" into "lost the run". Retrofitting persistence afterwards would have meant threading `save`/`load` through the executor, the session layer and the approval gate all at once — the seams are exactly the same either way, so they were store-shaped from the start.
-- **An external workflow engine (Temporal-style orchestration).** The SDK's premise is that it runs inside your Node process with no required service. Pushing durability to an orchestrator would make that service mandatory for basic multi-turn work.
-- **One store for everything.** Approvals and checkpoints are deliberately separate interfaces: an approval is a decision waiting to happen, a checkpoint is progress so far, and they have different lifecycles (delete-on-read `resolve()` vs overwrite `save()`). See the "approval record first, checkpoint second" ordering in [approvals](/core/approvals).
+## Rationale
 
-## Where it shows up
+Agents pause for humans — a human approval can legitimately take *days*. If a pause is an in-memory wait, the process dying silently turns "waiting for approval" into "lost the run". Durability is a correctness property of the pause, not a convenience.
 
-- `src/execution/checkpoint.ts` — the `Checkpoint` shape (transcript, `stepIndex`, `usage`, `businessState`, `status`, `approvalId`, `agentFingerprint`, `runConfig`, `principal`, `metadata`) and the `CheckpointStore` interface with its optional bounded `history()`.
-- `src/session/sessionStore.ts` — `MemorySessionStore` (the default) and `FileSessionStore` (atomic temp-file + rename).
-- `src/execution/ApprovalGate.ts`, `src/execution/resume.ts` — the pause/resume pair that makes an approval survive restarts; `resumeAfterApproval()` deletes the stale pre-pause checkpoint before re-entering `execute()` so resumption can't rehydrate it (LOU-K5).
-- `src/execution/errors.ts` — `SessionAwaitingApprovalError` carries `sessionId`, `approvalId` and `approvalKind` so a caller that stumbles onto a paused session knows exactly what to resolve.
-- `src/storage/` — `SqliteStore`, `fileStore()`, `memoryStore()`; `src/deploy/kvStore.ts` / `kvCheckpointStore.ts` for the Cloudflare Worker target.
+## Problem Statement
 
-Contributor ripples: every field added to `Checkpoint` or `PendingApproval` is a persistence-migration decision (old records must still load — hence the "absent on older checkpoints" comments); a run paused inside a sub-agent snapshots enough to re-extend the agent on resume; and `store` is a *run-level* option — after a `handoff()` the run keeps the entry agent's stores, and `createAgent` warns once when a target was built with `store`/`approvalStore`/`approve`/`permissionMode`/`approvalTtlMs` (`runLevelOptionNames` in `src/createAgent.ts`, `warnRunLevelOptions` in `src/handoffAgents.ts`, N6).
+The run loop needs its full state — transcript, `stepIndex`, `usage`, `businessState`, `status`, `approvalId`, `agentFingerprint`, `runConfig`, `principal`, `metadata` — to survive process death and be reloadable by a *different* process days later, so an approval resolved over HTTP can continue the exact run that produced it.
 
-## Trade-offs accepted
+## Business Value
 
-- `Checkpoint` payloads must survive `JSON.stringify`/`JSON.parse` — `businessState` is explicitly unvalidated JSON (checkpoint.ts), so the SDK gives no schema guarantees on it.
-- Store implementations are a consumer contract with subtle semantics (atomicity, `history` rings, `delete` with `keepHistory`), tested through contract tests (`checkpointHistory.contract.test.ts`, `sessionFork.contract.test.ts`).
-- Resume re-executes tool calls that have no recorded result — idempotence of a paused call is the tool's problem, not the store's. Partial (`tool.partial`) output is lost on a crash.
-- Durability is per-`sessionId`: the same-sessionId concurrency assumption is accepted rather than adding locking to stores.
+Makes human-in-the-loop a production feature rather than a demo one: server restarts, deploys and horizontal scaling stop being run-killers. It's also the SDK's differentiator — "no hosted runtime" only works if durability ships *with* the library instead of requiring an orchestrator service.
+
+# Goal
+
+### Primary Goal
+
+A run paused for approval — or crashed mid-batch — resumes correctly from a different process, using only `sessionId` + a pluggable store; zero in-memory state is required to resume.
+
+### Secondary Goals
+
+- Store implementations stay swappable (memory/file/SQLite/KV) behind one contract, so the same agent runs in tests and on Workers.
+- Adding a field to `Checkpoint`/`PendingApproval` never breaks loading of older records (backward-compatible persistence).
+
+# Scope
+
+## This project is for
+
+- Run pause/resume across processes and restarts; crash recovery to the last committed step; durable approvals; per-session checkpoint history rings.
+
+## This project is not for
+
+- Distributed locking or multi-writer coordination on a `sessionId` — the same-sessionId concurrency assumption is accepted.
+- Schema guarantees on `businessState` — it's explicitly unvalidated JSON (checkpoint.ts).
+- Idempotent side effects — a paused tool re-executes on resume; idempotence is the tool's contract, not the store's.
+
+# Solution
+
+Checkpoints commit at fixed points in the loop: after a model response requesting tools, after each recorded tool result, on abort/pause/finish (`checkpoint.ts`). Ordering matters at the pause boundary: the **approval record is written first, the checkpoint second** — a reader that sees the checkpoint can always find the approval ([approvals](/core/approvals)). Approvals are *claim-on-read* (`wx` claim files, `resolved_at` transactions, KV get+delete) so two processes can't both resolve one. `resumeAfterApproval()` deletes the stale pre-pause checkpoint before re-entering `execute()` so resumption can't rehydrate it (LOU-K5). A caller stumbling onto a paused session gets `SessionAwaitingApprovalError` carrying `sessionId`/`approvalId`/`approvalKind` (`src/execution/errors.ts`).
+
+# Other Solutions
+
+- **In-memory runs, persistence bolted on later** — rejected: retrofitting would thread `save`/`load` through executor, session layer and approval gate simultaneously; the seams are identical either way, so they were store-shaped from the start.
+- **External workflow engine (Temporal-style)** — rejected: makes a service mandatory for basic multi-turn work, contradicting "runs in your own Node process".
+- **One store interface for everything** — rejected: an approval is a decision-waiting (delete-on-read `resolve()`), a checkpoint is progress-so-far (overwrite `save()`); different lifecycles get different interfaces.
+
+## Challenges
+
+- `Checkpoint` payloads must survive `JSON.stringify`/`JSON.parse` — constrains what fields can hold.
+- Resume re-executes unanswered tool calls — crash semantics push idempotence onto tool authors; partial `tool.partial` output is lost.
+- `store` is a **run-level** option: after `handoff()` the run keeps the entry agent's stores — `createAgent` warns once when a target built its own (`runLevelOptionNames`, N6).
+
+# Implementation considerations
+
+- **Persistence migrations**: every new `Checkpoint`/`PendingApproval` field must load on old records ("absent on older checkpoints" comments mark the boundary).
+- **Sub-agent pauses**: a run paused inside a sub-agent snapshots enough to re-extend the agent on resume.
+- **Testing**: contract tests (`checkpointHistory.contract.test.ts`, `sessionFork.contract.test.ts`) run the same semantics against every store impl — a new store must pass them.
+- **Monitoring**: checkpoint writes are the durability signal; a run that checkpoints without finishing is either paused or dead — `agent.drift` events flag drift on resume.
 
 ## Example
 
 ```ts
 const agent = createAgent({ provider, store: new SqliteStore('./.lousho/jobs.db') });
-
 try {
   await agent.send('Book a table for 2', { sessionId: 'chat-42' });
 } catch (error) {
-  // Process restarted while paused: the checkpoint says awaiting-approval.
   if (error instanceof SessionAwaitingApprovalError) {
     await agent.approvals.resolve({ id: error.approvalId!, approved: true });
   }
 }
-
-// After a crash mid-run: finishes the interrupted turn, or null.
-await agent.resume('chat-42');
+await agent.resume('chat-42'); // after a crash mid-run
 ```
 
 ## Where next
 
-- [Durable execution](/core/durable-execution) — checkpoint lifecycle and resume semantics.
-- [Approvals](/core/approvals) — the snapshot + delete-on-read pause protocol.
-- [Sessions](/state/sessions) and [storage stores](/state/storage-stores) — the transcript side and the `AgentStore` bundle.
-- [Build targets](/ship/build-targets) — how the KV stores make this work on Workers.
+- [Durable execution](/core/durable-execution) — checkpoint lifecycle and resume semantics
+- [Storage stores](/state/storage-stores) — the four implementations and their trade-offs
+- [Build targets](/ship/build-targets) — KV stores on Workers

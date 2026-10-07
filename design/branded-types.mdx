@@ -1,59 +1,92 @@
 ---
 title: "Runtime brands over nominal types"
-description: "How the SDK marks objects it must recognize again — Symbol.for brands for cross-copy instanceof, unique symbols for private channels — and why ids stay plain strings."
+description: "Technical design: Symbol.for brands for cross-copy instanceof, unique symbols for private channels, and why ids stay plain strings."
 ---
 
-## The decision
+# Entry Point
 
-Where the SDK must later recognize "an object I made", it uses a runtime mark rather than TypeScript's structural typing or compile-only branded types. Three forms exist, chosen by who must share the mark:
+`src/utils/brand.ts` (`instanceOfBranded`, LOU-D42) and the brand sites: `Symbol.for('lousho.SDKError')` on `SDKError` (`src/utils/sdkError.ts`), the same pattern on `HookRegistry`; private `unique symbol` keys `RUN_EVENTS` (`src/execution/agentRun.ts`), `PROVIDER_EVENTS` (`src/providers/providerEvents.ts`), `TOOL_DEFERRAL`, `CODE_MODE`; the `globalThis` slot `lousho.providerInterceptor`; the non-enumerable `lousho.todoList` result brand (`src/tools/built-in/todo.ts`); `WeakSet`/`WeakMap` marks in `remoteAgent`/`handoffAgents`.
 
-- **`Symbol.for` brand + `Symbol.hasInstance`** (LOU-D42, `src/utils/brand.ts`): a class whose identity must survive duplicated SDK copies. `SDKError` and `HookRegistry` carry a `get [Symbol.for('lousho.*')]` on the prototype and a static `Symbol.hasInstance` that calls `instanceOfBranded()`: for the *base* class, any object showing the brand passes `instanceof`; for subclasses the default check runs, so only the base identity is equated across copies.
-- **Private `unique symbol` keys** (`Symbol('lousho.*')`, *not* `Symbol.for`): internal channels smuggled through public option objects — `RUN_EVENTS` on `ExecuteOptions` (`src/execution/agentRun.ts`), `PROVIDER_EVENTS` on generate options (`src/providers/providerEvents.ts`), `TOOL_DEFERRAL` (`src/execution/toolDeferral.ts`), `CODE_MODE` (`src/execution/codeMode.ts`). The field is unforgeable and unguessable without the symbol, invisible in the public type surface, and costs nothing at rest.
-- **`Symbol.for` slots on `globalThis`**: `lousho.providerInterceptor` (`src/providers/interception.ts`) — deliberately the *shared* variant, because the interceptor is process-wide and the CJS and ESM bundles must see the same one.
-- **Non-enumerable result brands**: `todo_write` marks its result with `Symbol.for('lousho.todoList')` via `Object.defineProperty(..., enumerable: false)` so a run recognizes it to emit `todo.updated` — surviving renamed or wrapped tools — while `JSON.stringify` never sees the mark (`src/tools/built-in/todo.ts`).
-- **WeakSet marks**: `remoteAgent()` products live in a module-private `WeakSet` (`src/subagents/remoteAgent.ts`), handoff registrations in a `WeakMap` (`src/handoffAgents.ts`) — membership can't be forged by a duck-typed lookalike.
+# Background
 
-## Alternatives rejected
+## Rationale
 
-- **Plain `instanceof`.** Breaks under the dual-package hazard: a process that loads both the CJS and ESM build (or two nested copies) gets two class identities. The brand makes `error instanceof SDKError` hold either way.
-- **`error.name` / `.constructor.name` checks.** Minification renames them and any object can fake them. The codebase does use a `name` check for `CassetteMismatchError` — but only as a fallback alongside the branded `instanceof SDKError` (`isCassetteError`, `src/execution/errors.ts`).
-- **Compile-time nominal types** (`type SessionId = string & { __brand: ... }`). Not used for ids: a `sessionId` is just a `string`, validated at trust boundaries by `assertSessionId` (`src/session/sessionId.ts`) because ids become file names. Nominal id types would force every consumer to cast or wrap, buy nothing at runtime, and can't help the dual-copy problem at all — the brands solve the problem that actually exists (runtime recognition across copies), so the type system is left alone. *(Inference: no branded-id types exist anywhere in `src/`; the validation-at-boundary pattern is what the code does instead.)*
-- **`Symbol.for` for the private channels.** A registered symbol is reachable by anyone who knows its name — precisely what `RUN_EVENTS` & co. must not be, since they carry internals consumers shouldn't set.
+The SDK ships dual CJS/ESM bundles, and a process can end up loading both (or two nested copies). TypeScript's structural typing and `instanceof` both fail there — two class identities for the same class. The SDK needs a way to recognize "an object I made" that survives duplicated copies.
 
-## Where it shows up
+## Problem Statement
 
-Contributor ripples: a new error class automatically participates via `SDKError`'s inherited brand getter — no per-subclass work. But adding a class whose `instanceof` must survive copies means wiring `Symbol.for` + `instanceOfBranded` by hand (copy `HookRegistry`). And a `unique symbol` option is invisible to object spread and `JSON.stringify` — features that need to serialize options can't see those fields.
+How does the SDK reliably identify its own objects — errors, hook registries, hidden option channels, remote-agent products — when two copies of the package may be live in one process, without polluting the public type surface or adding runtime cost?
 
-## Trade-offs accepted
+## Business Value
 
-- The brand is a getter on the prototype, so subclass instances of a *foreign* copy pass `instanceof SDKError` but not `instanceof ConfigurationError` — cross-copy checks are only reliable on the branded base. Code branches on `error.code` for the fine-grained case anyway.
-- `unique symbol` channels are per-copy: an options object built by one copy can't smuggle its hidden field into another copy's call. Accepted because these channels are internal-only.
-- `Symbol.for` brands are spoofable by a determined consumer — they guard against *accidental* identity loss, not adversarial objects; the `WeakSet` marks cover the cases where forgery would matter.
+`error instanceof SDKError` and internal channels keep working in real-world bundling (dual formats, nested deps) — the failure mode without brands is silent misidentification, which is worse than a crash.
+
+# Goal
+
+### Primary Goal
+
+Every object the SDK must re-recognize carries a runtime mark appropriate to who must share it — `Symbol.for` for cross-copy identity, `Symbol()` for unforgeable internal channels, `globalThis` symbols for process-wide seams, `WeakSet`/`WeakMap` for unspoofable membership.
+
+### Secondary Goals
+
+- Compile-time surface stays clean: no branded-id nominal types; `sessionId` is a plain `string`, validated at boundaries by `assertSessionId` (ids become file names).
+
+# Scope
+
+## This project is for
+
+- Runtime identity marks for values the SDK produces and re-recognizes; the private-channel mechanism for options objects.
+
+## This project is not for
+
+- Nominal/branded *id* types (`SessionId = string & {__brand}`) — deliberately absent; brands solve runtime recognition, boundary validation solves id correctness. A `name` check appears exactly once (`isCassetteError`) and only as fallback alongside the branded `instanceof`.
+
+# Solution
+
+Five forms, chosen by who must share the mark:
+
+| Mark | Scope | Use |
+|---|---|---|
+| `Symbol.for` + `Symbol.hasInstance` | cross-copy | `SDKError`, `HookRegistry` — base-class `instanceof` via `instanceOfBranded`; subclasses keep default check |
+| `Symbol()` unique symbol | one copy, invisible | `RUN_EVENTS`, `PROVIDER_EVENTS`, `TOOL_DEFERRAL`, `CODE_MODE` on public options — unforgeable, invisible to spread/`JSON.stringify` |
+| `Symbol.for` on `globalThis` | process-wide | `lousho.providerInterceptor` — CJS and ESM bundles must see the same one |
+| Non-enumerable `Symbol.for` property | recognizable, hidden | `lousho.todoList` result brand → emits `todo.updated`; `JSON.stringify` never sees it |
+| `WeakSet`/`WeakMap` | membership | remote-agent products, handoff registrations — membership can't be faked by a lookalike |
+
+# Other Solutions
+
+- **Plain `instanceof`** — rejected: two copies = two class identities; the dual-package hazard.
+- **`error.name`/`constructor.name` checks** — rejected: minification renames them, anything can fake them.
+- **Compile-time nominal types** — rejected for ids: buys nothing at runtime, forces casts on every consumer, can't fix cross-copy identity. *(Inference: no branded-id types exist anywhere in `src/`.)*
+- **`Symbol.for` for private channels** — rejected: a registered symbol is reachable by anyone who knows its name — precisely what internals must not be.
+
+## Challenges
+
+- The brand is a prototype getter, so a foreign copy's `ConfigurationError` passes `instanceof SDKError` but not `instanceof ConfigurationError` — fine-grained branching uses `error.code` anyway.
+- `Symbol.for` brands are spoofable by a determined consumer — they guard *accidental* identity loss; `WeakSet` marks cover the cases where forgery matters.
+- `unique symbol` channels are per-copy — an options object from copy A can't smuggle its hidden field into copy B's call; accepted because the channels are internal.
+
+# Implementation considerations
+
+- **New error classes get the brand free** via `SDKError`'s inherited getter; a *new cross-copy class* needs hand-wired `Symbol.for` + `instanceOfBranded` (copy `HookRegistry`).
+- **Serialization**: `unique symbol` fields are invisible to object spread and `JSON.stringify` — anything that must serialize options can't see them.
+- **Dual-format awareness**: any change to the CJS/ESM build boundary is where a new copy gets introduced.
 
 ## Example
 
 ```ts
-// src/utils/sdkError.ts — the pattern every cross-copy class copies
+// src/utils/sdkError.ts — the cross-copy pattern
 const SDK_ERROR_BRAND = Symbol.for('lousho.SDKError');
-
 export class SDKError extends Error {
-  static [Symbol.hasInstance](value: unknown): boolean {
-    return instanceOfBranded(this, SDKError, SDK_ERROR_BRAND, value);
+  static [Symbol.hasInstance](v: unknown) {
+    return instanceOfBranded(this, SDKError, SDK_ERROR_BRAND, v);
   }
-  get [SDK_ERROR_BRAND](): true {
-    return true;
-  }
+  get [SDK_ERROR_BRAND](): true { return true; }
 }
-```
-
-```ts
-// src/execution/agentRun.ts — a private channel on a public options type
-export const RUN_EVENTS: unique symbol = Symbol('lousho.agentRunEvents');
-export type StreamingExecuteOptions = ExecuteOptions & { [RUN_EVENTS]?: RunEventSink };
 ```
 
 ## Where next
 
-- [Errors](/core/errors) — where `Symbol.for('lousho.SDKError')` earns its keep.
-- [Build targets](/ship/build-targets) — the dual CJS/ESM `dist/` outputs that create the second copy.
-- [Streaming events](/core/streaming-events) — `RUN_EVENTS` and `PROVIDER_EVENTS` as sinks.
+- [Errors](/core/errors) — where `Symbol.for('lousho.SDKError')` earns its keep
+- [Build targets](/ship/build-targets) — the dual `dist/` outputs that create the second copy
+- [Streaming events](/core/streaming-events) — `RUN_EVENTS`/`PROVIDER_EVENTS` as sinks

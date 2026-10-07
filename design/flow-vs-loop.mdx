@@ -1,58 +1,83 @@
 ---
 title: "Flows vs. the agent loop"
-description: "Why the SDK ships two control flows — a model-driven tool loop and a deterministic FlowExecutor — and the constraints each accepts."
+description: "Technical design: why the SDK ships two control flows — a model-driven tool loop and a deterministic FlowExecutor — and the constraints each accepts."
 ---
 
-## The decision
+# Entry Point
 
-The SDK keeps **two** ways to sequence model work. The agent loop (`AgentExecutor`) asks the model what to do next on every turn — open-ended, bounded by `maxSteps`, budgets, permissions and approvals. `FlowExecutor` (`src/flows/FlowExecutor.ts`) executes a fixed graph of `sequence` / `parallel` / `oneOf` / `forEach` / `llmCall` / `toolCall` / `setVariable` / `evaluator` / `return` / `end` / `throw` nodes — the *harness* decides the order, and the model only fills `llmCall` nodes. When the pipeline is known in advance, deterministic orchestration wins: the model cannot skip the verify phase, reorder the spec→plan→implement ladder, or forget the merge step after a parallel fan-out (`examples/phase-pipeline`, `examples/waves`).
+Two executors: `AgentExecutor` (`src/execution/AgentExecutor.ts`) — the model-driven tool loop behind `createAgent`/`send`/`stream` — and `FlowExecutor` (`src/flows/FlowExecutor.ts`) + `FlowBuilder`/`validators.ts`, reached via `examples/*` and spec/kit composition. The type split is declared in `src/types/flow.ts` (`EditorShapeStep` vs `RuntimeStep`); conditions run through `evaluateSafeExpression` (`src/flows/safeExpression.ts`).
 
-## Alternatives rejected
+# Background
 
-- **Prompting the loop into compliance.** "Always verify after editing" in a system prompt is a suggestion the model follows most of the time; a flow's `oneOf` chain makes the retry ladder structural. Phase/wave patterns need *guaranteed* ordering — that is the whole reason flows exist.
-- **Loops inside the executor.** `LoopNode` (`type: 'loop'`, `maxIterations`, `condition`, `loopFlow`) is an **editor-side shape only** (`EditorShapeStep` in `src/types/flow.ts`): it has no entry in `FlowExecutor`'s handler map, so a `loop` reaching `dispatchNode` throws `LOUSHO_FLOW_INVALID`. The runtime shapes (`RuntimeStep`) are a smaller, total set; repetition at run time goes through `forEach` over known items, and anything genuinely open-ended belongs to the agent loop. *(Inference: keeping unbounded "run until condition" graphs out of the executor keeps every flow run finite except through `forEach` item counts and the `maxDepth` guard — default 100 — while visual editors keep the richer node set.)*
-- **`return` as control flow.** A `return`/`end` node just resolves its `value` — it does **not** early-exit a `sequence` (`executeSequence` runs every step and yields the last result). Early exit is expressed with `oneOf` branch selection, which is why routing flows put `return` nodes *inside* options. This matches the node-as-value-producer model: every node evaluates to something; `oneOf` is the only brancher.
-- **`eval`/`new Function` for conditions.** Flow definitions can come from untrusted editors and registries, so `oneOf` conditions and `evaluator` expressions run through `evaluateSafeExpression` (`src/flows/safeExpression.ts`) — a hand-written recursive-descent evaluator that never compiles host code, rejects `constructor`/`__proto__`/globals/assignment, and allow-lists only `includes`/`startsWith`/`endsWith`. Crucially, `{{name}}` placeholders are *bound as values*, never pasted into expression text — a variable containing `x' === 'x' || 'a` is data, not an injection.
+## Rationale
 
-## Where it shows up
+Two different jobs need sequencing: "let the model improvise within bounds" (open-ended tool work) and "the order is the contract" (phase pipelines, routing, fan-out). One mechanism can't serve both — a loop can't guarantee ordering, and a deterministic graph can't improvise.
 
-- `src/flows/FlowExecutor.ts` — the static, instance-free executor: per-type handler map, `step-start`/`step-complete`/`step-error` events, OTel `flow.node`/`chat`/`execute_tool` spans, sandbox routing via `executeToolWithSandboxGuard`.
-- `src/flows/safeExpression.ts` — the expression grammar (`docs/flows.md#flow-expressions`).
-- `src/types/flow.ts` — the deliberate split: `EditorShapeStep` (what editors produce: `step`, `loop`, `condition`, `bestOfAll`, `uiComponent`, `tool`, …) vs `RuntimeStep` (what the executor runs).
-- `src/flows/FlowBuilder.ts`, `validators.ts` — metadata builder plus validation; `isCreateAgentResult` rejects a live agent as `context.agent` (LOU-R14) — a flow's steps run under a plain `AgentConfig` (`{ name, prompt?, settings }`), because a `createAgent()` agent runs *itself*.
+## Problem Statement
 
-Two interpolation regimes, deliberately different: prompts and tool arguments use flat `{{var}}` text substitution (regex `\{\{(\w+)\}\}`, `toString()`, missing → `''`; `interpolate`/`resolveValue`/`$var` references) — dumb and predictable, because the output is model input. Branch conditions use the safe-expression grammar, because they decide control flow.
+When a pipeline is known in advance, the model must not be able to skip the verify phase, reorder spec→plan→implement, or forget the merge after a parallel fan-out (`examples/phase-pipeline`, `examples/waves`). But most agent work is genuinely open-ended and needs the loop.
 
-## Trade-offs accepted
+## Business Value
 
-- **Flows lose the loop's guardrails.** A `toolCall` node goes through the sandbox guard but *not* the approval gate, hooks, permission modes, or checkpointing — no pause-for-human, no resume, no `needsApproval`. Durable or gated work must call the executor/agent loop, not a flow.
-- Two syntaxes to learn (`{{var}}` in prompts vs expression grammar in conditions), and the flat interpolation can't reach nested paths (`{{user.name}}` doesn't match `\w+` — use `setVariable`/`evaluator` or `$` references).
-- Editor/executor duality: a node type that exists in `EditorShapeStep` but not `RuntimeStep` fails at run time, not at build time — the editor must lower it.
-- The executor predates the store/session machinery; bridging them is examples-level work today (`phase-pipeline` orchestrates agents *around* flows).
+Deterministic orchestration is what makes phase/wave patterns *guarantees* rather than prompt suggestions — the difference between "the model usually verifies" and "the harness runs verify". It's the machinery behind the phase-engineering example and any order-critical pipeline.
+
+# Goal
+
+### Primary Goal
+
+Two composable control flows: `AgentExecutor` for model-driven turns bounded by `maxSteps`/`limits`/permissions, and `FlowExecutor` for deterministic graphs where the model only fills `llmCall` nodes — with no overlap in responsibility.
+
+### Secondary Goals
+
+- Flow definitions from untrusted editors run without `eval`/`new Function` (safe-expression grammar).
+- Flows stay embeddable: a flow runs under a plain `AgentConfig` (`isCreateAgentResult` rejects a live agent — LOU-R14), so it composes inside agents, not the other way.
+
+# Scope
+
+## This project is for
+
+- The `RuntimeStep` set: `sequence`, `parallel`, `oneOf`, `forEach`, `llmCall`, `toolCall`, `setVariable`, `evaluator`, `return`, `end`, `throw` — 11 node types with total handlers.
+
+## This project is not for
+
+- Durable or human-gated work inside a flow — `toolCall` nodes go through the sandbox guard but *not* approvals/hooks/checkpointing; that work belongs to the loop.
+- Runtime `loop`/`condition`/`uiComponent`/`bestOfAll` nodes — `EditorShapeStep` types exist for visual editors but have no handler; a `loop` reaching `dispatchNode` throws `LOUSHO_FLOW_INVALID`.
+
+# Solution
+
+`FlowExecutor` is static and instance-free: a per-type handler map dispatches nodes, emitting `step-start`/`step-complete`/`step-error` events and OTel `flow.node`/`chat`/`execute_tool` spans; tool calls route through `executeToolWithSandboxGuard`. Two deliberately different interpolation regimes: prompts/tool args use flat `{{var}}` substitution (regex `\{\{(\w+)\}\}`, `toString()`, missing → `''` — dumb and predictable because output is model input); `oneOf`/`evaluator` conditions use `evaluateSafeExpression` — a recursive-descent evaluator, no host code, allowlists `includes`/`startsWith`/`endsWith`, binds `{{name}}` as *values* (a variable containing `x' === 'x' || 'a` is data, not injection). `return`/`end` resolve a value but don't early-exit — `executeSequence` runs every step; branching is expressed by `oneOf`, never by bailing.
+
+# Other Solutions
+
+- **Prompting the loop into compliance** — rejected: "always verify after editing" is a suggestion the model follows most of the time; a `oneOf` chain makes it structural. Guaranteed ordering is the whole reason flows exist.
+- **Loops inside the executor** — rejected: a `loop` node would let an untrusted definition run unboundedly; repetition goes through `forEach` over known items, open-ended work through the agent loop. *(Inference: keeping "run until condition" graphs out of the executor keeps every run finite modulo `forEach` counts and the `maxDepth` guard, default 100.)*
+- **`return` as early-exit control flow** — rejected: every node is a value-producer; `oneOf` is the only brancher, which is why routing flows put `return` inside options.
+- **`eval`/`new Function` for conditions** — rejected: flow definitions come from untrusted editors/registries; the safe-expression grammar rejects `constructor`/`__proto__`/globals/assignment.
+
+## Challenges
+
+- Editor/executor duality: a node in `EditorShapeStep` but not `RuntimeStep` fails at *run* time — the editor must lower it.
+- Two syntaxes: `{{var}}` flat text vs expression grammar; `{{check.feedback}}` can't resolve (`\w+` no dots) — nested values go through `$` references/`setVariable`.
+- The executor predates store/session machinery — bridging is examples-level today (`phase-pipeline` orchestrates agents *around* flows).
+
+# Implementation considerations
+
+- **Adding a node type**: handler in `FlowExecutor` + `RuntimeStep` type + validator — and decide whether it's editor-shape or runtime.
+- **Untrusted input**: conditions/variables are bound as values, never pasted into expression text; `maxDepth` (100) bounds recursion.
+- **No durability**: flows emit events and spans but no checkpoints — a crashed flow restarts, it doesn't resume.
 
 ## Example
 
 ```ts
-// a routing decision the model can't skip or reorder
-const steps: EditorStep = {
-  type: 'sequence',
-  steps: [
-    { type: 'llmCall', prompt: 'Classify: {{message}}', outputVariable: 'category' },
-    {
-      type: 'oneOf',
-      options: [
-        { condition: "'{{category}}' === 'billing'", step: billingFlow },
-        { condition: 'confidence >= 0.7', step: autoReply },   // bound as a value
-        { step: humanReview },                                // no condition = default
-      ],
-    },
-  ],
-};
+{ type: 'oneOf', options: [
+  { condition: "check.startsWith('PASS')", step: reportPhase },
+  { step: { type: 'sequence', steps: [retryImpl, checkAgain] } },
+]}
 ```
 
 ## Where next
 
-- [Flows](/compose/flows) — node reference, `FlowBuilder`, events.
-- [Execution loop](/core/execution-loop) — the model-driven alternative.
-- [Approvals](/core/approvals) and [durable execution](/core/durable-execution) — what the loop has that flows don't.
-- [Typed decisions](/design/typed-decisions) — what feeds the `oneOf` conditions.
+- [Flows](/compose/flows) — node reference, events, executor internals
+- [Execution loop](/core/execution-loop) — the model-driven alternative
+- [Phase engineering](/techniques/phase-engineering) — the pattern flows exist for
+- [Typed decisions](/design/typed-decisions) — what feeds `oneOf` conditions
