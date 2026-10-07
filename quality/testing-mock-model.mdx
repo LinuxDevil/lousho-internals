@@ -1,0 +1,66 @@
+---
+title: "mockModel: the scripted model double"
+description: "How src/testing/mockModel.ts gives tests a deterministic, offline LLMProvider with scripted turns, recorded requests and failure injection."
+---
+
+`mockModel()` is the test double every agent test is built on: a `LLMProvider` that answers each `generate()`/`stream()` call with the next scripted turn, records every request it saw, and never touches the network. Determinism is the point — no randomness, no clock dependence (except opt-in `delayMs`), so a failing test diffs exactly.
+
+## Entry points
+
+- `mockModel(script, options?)` — `src/testing/mockModel.ts`, exported from `@lousho/build-ai-agent/testing` (`src/testing/index.ts`).
+- `MockTurn` = `string | MockTurnObject | (request: MockRequest) => MockStaticTurn | Promise<...>` — a turn is shorthand text, a full object, or a function that builds the reply from the incoming (deep-frozen) request.
+- `MockTurnObject` fields: `text`, `toolCalls`, `hostedToolCalls`, `error`, `usage`, `finishReason`, `delayMs`.
+- Assertion surface: `model.calls`, `model.lastCall`, `model.assertExhausted()`, `model.reset()`.
+- Siblings in the same subpath: `testToolContext()` (a minimal `ToolExecutionContext` for calling `tool.execute` directly), `hashEmbedder()` (deterministic offline embeddings), `setProviderInterceptor()` (the interception seam evals use).
+
+## How it works
+
+`ScriptedMockModel` keeps a script array and an index. Each `generate()` or `stream()`:
+
+1. Snapshots the `GenerateOptions` into `calls` via `cloneFrozen` — plain objects/arrays are deep-copied and `Object.freeze`n, while non-plain values (functions, zod schemas inside tool definitions) are kept by reference because they cannot be structurally cloned.
+2. Pulls `script[index++]`. If the script is exhausted it throws a descriptive error naming the call number and the last message (`describeLastMessage`), unless `onExhausted: 'repeat-last'` replays the final turn forever.
+3. Awaits function turns (sync or async), honours `delayMs`, then throws `turn.error` if set — the `error` entry is how tests script provider failures mid-run.
+4. Maps `toolCalls` to real `ToolCall`s (`{ id: 'call_N', type: 'function', function: { name, arguments: JSON.stringify(args ?? {}) } }`) and `hostedToolCalls` to `HostedToolCall`s (`hosted_N` ids, sharing the same counter). `finishReason` defaults to `'tool_calls'` when calls exist, else `'stop'`. `usage` maps `{ inputTokens, outputTokens }` to the provider's `promptTokens`/`completionTokens`/`totalTokens` shape; omitted entirely when not scripted, like a backend that reports no usage (the executor then estimates and flags `lousho.usage.estimated`).
+
+`stream()` yields the same semantics as chunks: `hosted-tool-call` + `hosted-tool-result` pairs first, then word-sized `text-delta`s (from `/\S+\s*|\s+/g`), then `tool-call`s, then `finish` — so streamed and non-streamed runs behave identically, the M9 invariant the older `MockLLMProvider` also keeps.
+
+`assertExhausted()` throws `LOUSHO_TEST_FAILED` when scripted turns remain — it catches agents that stopped calling the model earlier than the test expected.
+
+## Design decisions
+
+- **Requests are deep-frozen snapshots.** A test asserting on `model.calls[0]` cannot be corrupted by the agent mutating its own options afterwards, and the readonly `MockRequest` type (`DeepReadonly<GenerateOptions>`) makes mutation a type error too.
+- **Errors are scripted turns, not a mode.** `{ error: new SDKError(...) }` sits inline in the script, so multi-step runs can fail on step 3 after two successful tool calls — much more useful than `MockLLMProvider.simulateError`, which fails every call.
+- **`supportsHostedTool()` returns true for everything.** The mock accepts any hosted tool; the turn scripts which calls the "provider" ran (`hostedToolCalls`), reported with `executedBy: 'provider'` and never executed by the agent (N1a).
+- **The older `MockLLMProvider` (`src/providers/mock.ts`) still exists** for spec-file/`lousho dev` smoke paths — it cycles canned strings and guesses tool calls by name-matching the last user message. New tests should use `mockModel`; the provider registry registers `mock` centrally via `builtinProviders.ts`, not a module side effect (LOU-R1).
+- **Exhaustion defaults to `throw`.** A too-short script is a test bug; `'repeat-last'` is the explicit opt-out for loops with unknown step counts.
+
+## Example
+
+```ts
+import { createAgent } from '@lousho/build-ai-agent';
+import { mockModel } from '@lousho/build-ai-agent/testing';
+
+// A multi-turn tool-call sequence, then an injected provider failure:
+const model = mockModel([
+  { toolCalls: [{ name: 'get_weather', args: { city: 'Paris' } }] },
+  'It is 21°C in Paris.',
+]);
+
+const agent = createAgent({ prompt: '...', provider: model, tools });
+await agent.send('Weather in Paris?');
+
+expect(model.calls).toHaveLength(2);   // every request the agent sent, deep-frozen
+model.assertExhausted();               // fails if scripted turns were never used
+
+// Error turns and request-aware turns:
+const flaky = mockModel([
+  (req) => `echo: ${req.messages.at(-1)?.content}`,
+  { error: new Error('provider blew up') },
+]);
+```
+
+## Where next
+
+- [recordReplay: cassettes](/quality/record-replay) — the other half of offline testing: recorded real-model runs.
+- [Evals](/quality/evals) — `defineEval` uses `mockModel` as the deterministic provider for trajectory evals.
+- [Observability](/quality/observability) — `usage`/cost attributes the mock's scripted `usage` feeds.

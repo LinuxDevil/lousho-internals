@@ -1,0 +1,60 @@
+---
+title: "Observability: spans, GenAI semconv and trace files"
+description: "How tracing works inside the SDK: the exporter-agnostic Span/TraceExporter seam, OTel GenAI span names and attributes, cost rollups, and the .lousho/traces file format."
+---
+
+Observability is three layers: a tiny internal span abstraction (`src/execution/tracing.ts`) that ships **no** backend, GenAI-semantic-convention span builders (`src/execution/genAiSpans.ts` + `semconv.ts`), and two ready-made exporters — `createOtelTraceExporter()` (real OpenTelemetry, optional peer) and `fileTraceExporter()` (JSONL files `lousho traces` reads). Cost and token usage ride along as span attributes and roll up to the run result.
+
+## Entry points
+
+- `withSpan(exporter, name, attributes, fn, parentId?, kind?)` — `src/execution/tracing.ts`. The only span mechanism; `TraceExporter = { onSpanStart, onSpanEnd }`.
+- `createOtelTraceExporter(options?)` — `src/execution/otel.ts`, subpath `@lousho/build-ai-agent/otel`. `@opentelemetry/api` is an *optional peer*; importing anything else never loads it.
+- `fileTraceExporter({ dir? })` — `src/traces/fileTraceExporter.ts`, subpath `/traces`. Writes `.lousho/traces/<YYYY-MM-DD>/<traceId>.jsonl` (default `DEFAULT_TRACE_DIR`).
+- Readers: `listTraces({ dir?, limit? })`, `readTrace(traceId | prefix)`, `findTraces` — `src/traces/readTraces.ts`; `lousho traces [--dir] [--limit] [--json]` / `lousho traces <id> [--content]` — `src/cli/traces.ts`.
+- All names/keys: `src/execution/semconv.ts` (`GenAiOperation`, `GenAiAttr`, `GenAiMetric`, `SdkAttr`, `LegacyAttr`, `FlowAttr`).
+- `Span` (`{ id, name, attributes, startTime, endTime?, parentId?, kind?, status? }`), `SpanKind`, `SpanStatus`, `TraceExporter` — re-exported from `/traces` for consumers building their own exporter.
+
+## How it works
+
+**Span tree.** One agent run produces `invoke_agent {agent.name}` (internal) → per model call a `chat {model}` span (**client** kind, the only client spans) → per tool call `execute_tool {name}`. Flow runs use `invoke_workflow`, flow nodes `flow.node {type}` with `lousho.flow.*` attributes. Parenting is explicit `parentId` threading — `withSpan` generates `newId()`, passes the mutable `Span` to `fn` (attributes are enriched at start and again at end), and always ends the span in a `finally` (errors get `recordSpanError`: `error.type` = error name or `_OTHER`, status `{ code: 'error' }`, then rethrow). With `exporter: undefined` nothing is emitted but `fn` still runs — `withSpan` never throws for a missing exporter.
+
+**Attributes** (`genAiSpans.ts`). `chat` spans carry `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model|temperature|max_tokens`, then on completion `gen_ai.response.model` (read off `rawResponse`), `gen_ai.response.finish_reasons` (`tool_calls` → spec's singular `tool_call`), `gen_ai.usage.input_tokens|output_tokens`. `execute_tool` adds `gen_ai.tool.name|call.id|description|type='function'`; `invoke_agent` adds `gen_ai.agent.name|id`, `gen_ai.conversation.id`. Pre-LOU-D9 attributes (`model`, `prompt`, `toolName`, `args`, `result`, `latencyMs`, ...) are **dual-emitted** as deprecated `LegacyAttr`s.
+
+**Content is opt-in.** `gen_ai.system_instructions|input.messages|output.messages|tool.call.arguments|tool.call.result` are only recorded with `captureContent: true` (or env `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`); `redactContent: true` also drops the legacy content attrs. Trace files are exempt from this framing — they store whatever spans carry, which is why `lousho dev --traces` is opt-in and documents that files can hold prompt/tool content.
+
+**Usage + cost.** `recordLlmResult` stamps token counts plus SDK-private attrs: `lousho.cost_usd` (from `estimateCost(usage, model)` when the price table knows the model), `lousho.usage.estimated` (provider reported no usage, executor estimated — LOU-V5), `lousho.usage.reasoning_tokens`, `lousho.hosted_tool_calls` (names of provider-run tools, which get **no** `execute_tool` span). `withSpan` maintains a per-open-span rollup: finished children add `lousho.cost_usd` to the parent, so `invoke_agent` ends with cumulative cost — but it's *absent* if any token-using child had an unknown price, and `lousho.usage.estimated` propagates upward. `ExecutionResult.usage` mirrors this (`costUsd`, `estimated`, `hostedToolCalls`).
+
+**OTel bridge** (`otel.ts`). Maps each `Span` to a real OTel span via `trace.getTracer`, parenting through `context` (not ambient), kind CLIENT for `chat`, status ERROR on error; non-primitive attribute values are JSON-stringified (OTel requirement). Also records GenAI client metrics when `metrics !== false`: `gen_ai.client.token.usage` and `gen_ai.client.operation.duration` histograms with spec bucket boundaries, attributed by operation/provider/model/`error.type` (`gen_ai.token.type` = `input`/`output` splits the token records). No registered `TracerProvider`/`MeterProvider` → OTel's no-op implementations discard silently.
+
+**Trace files.** `fileTraceExporter` writes one JSONL line per finished span (`v: 1`, `traceId` = root span id, file named for it, day folder = root's local start date), `appendFileSync` per span so each line is complete even on crash; write failures warn once (`console.warn`) and never throw into a run. `readTraces` sums `chat`/`execute_tool` spans into `TraceSummary` (modelCalls, toolCalls, tokens, `costUsd` off the root) and tolerates a truncated final line. `readTrace(idOrPrefix)` accepts a unique id prefix and throws `LOUSHO_CONFIG_INVALID` when a prefix is ambiguous. The `lousho traces` CLI reads files only — it imports `src/traces/`, never the run loop; `--content` surfaces the opt-in content attributes. `lousho dev`/`chat` take `--traces[=dir]` (opt-in because files hold prompt/tool content; `lousho init` projects ignore `.lousho/`), and Agent Forge writes per-agent traces to `.lousho/agents/<id>/traces` (M5b).
+
+## Design decisions
+
+- **BYO exporter core** (`tracing.ts` imports no `node:*`, no OTel): the SDK never forces a backend, and `withSpan` with `exporter: undefined` costs almost nothing.
+- **Dual emission** of legacy + GenAI attribute names: pre-D9 dashboards kept working while the conventions (still `Development` stability — `gen_ai.system` already renamed once) settle. Pin the SDK version before building dashboards on them.
+- **Cost absent ≠ cost zero**: unknown model price means the attribute is omitted rather than reported as $0 — the same rule `t.maxCostUsd()` relies on when it skips instead of failing.
+- **Legacy attributes are deprecated but still emitted** (`LegacyAttr` dual-emit): pre-LOU-D9 consumers reading `model`/`promptTokens`/`latencyMs` keep working while the GenAI names stabilize.
+- **`/otel` and `/traces` are separate subpaths** precisely so their imports (`@opentelemetry/api`, `node:fs`) stay out of the root bundle — and `tracing.ts` itself imports no `node:*`, so it runs in Workers.
+- **OTel parenting uses stored contexts, not ambient**: `parentId` maps to the recorded `Context` the parent span was started in, so a detached child (e.g. an approved tool call running before the resumed run's first step) still nests correctly.
+- **Metrics are opt-out, not opt-in** (`metrics?: boolean`, default true): with no `MeterProvider` they're silently discarded, so enabling them costs nothing for exporters that don't care.
+- **Hosted tools get a name-list, not spans** (`lousho.hosted_tool_calls`): the provider ran them inside the model call, so an `execute_tool` span would claim work the SDK never did.
+
+## Example
+
+```ts
+import { fileTraceExporter } from '@lousho/build-ai-agent/traces';
+import { createOtelTraceExporter } from '@lousho/build-ai-agent/otel';
+
+// Local files for `lousho traces`:
+const agent = createAgent({ model: 'openai/gpt-4o-mini', exporter: fileTraceExporter() });
+
+// Real OTel (host app registers the TracerProvider):
+const exporter = createOtelTraceExporter({ tracerName: 'my-agent' });
+await AgentExecutor.execute({ agent, input, provider, exporter, captureContent: true });
+```
+
+## Where next
+
+- [Streaming events](/core/streaming-events) — the event stream vs. the span tree.
+- [Evals](/quality/evals) — `t.maxCostUsd()` gates on the same `usage.costUsd`.
+- [Docs pipeline](/quality/docs-pipeline) — snippet verification covers these examples.

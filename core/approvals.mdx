@@ -1,0 +1,61 @@
+---
+title: "Approvals: the durable pause"
+description: "How a tool call pauses a run durably — ApprovalGate, ApprovalStore, the ExecutionSnapshot, resumeAfterApproval's replay path, TTL, sign-in/question kinds, and the createAgent approvals facade."
+---
+
+An approval is not an in-memory wait: when a tool call's gate decides `ask`, the executor serializes enough of the run to restart it (`ExecutionSnapshot`) next to a `PendingApproval` record in an `ApprovalStore`, ends the `execute()` call with `finishReason: 'awaiting-approval'`, and *any* later call — same process, another process, days later — can `resumeAfterApproval()` to continue the run. Durability is the whole design.
+
+## Entry points
+
+- `PendingApproval`, `ApprovalDecision`, `ExecutionSnapshot`, `ApprovalStore`, `ResolvedApproval`, `SubagentSuspension`, `describeApproval`, `approvalExpired`, `ASK_QUESTION_TOOL_NAME` — `src/execution/ApprovalGate.ts`.
+- `InMemoryApprovalStore` — `src/execution/InMemoryApprovalStore.ts`; `StorageServiceApprovalStore` — `ApprovalGate.ts`.
+- Pause side: `pauseForApproval`, `savePause`, `pauseForSignIn` — `src/execution/AgentExecutor.ts`.
+- Resume side: `resumeAfterApproval`, `streamResumeAfterApproval`, `resumeRequest`, `ResumeExecuteOptions` — `src/execution/resume.ts`; sub-agent resume in `src/execution/resumeSubagent.ts`.
+- `createAgentApprovals`, `ApproveToolCall`, `AgentApprovals` — `src/createAgentApprovals.ts`.
+
+## How it works
+
+**Pause** (AgentExecutor `pauseForApproval` → `savePause`):
+
+1. The tool-call gate sets `requiresApproval` (`needsApproval`, an `ask` permission rule, or a sub-agent suspension). The batch halts at the *first* such call — earlier calls' results are recorded, later calls become `remainingToolCalls` on the snapshot.
+2. A `PendingApproval` is built: `id`, `toolCallId`, `toolName`, `args`, `agentId`, `createdAt`, optional `expiresAt` (from the `ask` rule's `ttlMs` or `approvalTtlMs`), `kind` (`'tool'` default, `'question'` for `ask_question`, `'sign-in'` for OAuth), `principal`.
+3. The `ExecutionSnapshot` captures `agent` (base — skills/sub-agents re-applied on resume), `currentMessages` (+ queued input), `steps`, `sessionId`, `remainingToolCalls`, `usage`, `agentFingerprint`, `principal`, `metadata`, and `subagent` when the pause came from a `task` call.
+4. **Approval record first, checkpoint second** (`savePause`): a crash between the writes leaves a resumable `'in-progress'` checkpoint, never an `'awaiting-approval'` checkpoint naming a lost approval. Then `approval.requested` fires and the result resolves.
+
+**Decide.** `ApprovalStore.resolve(id)` is *delete-on-read* — an approval decides exactly once. `createAgentApprovals` wraps the store to track `pending` for `agent.approvals.list()`/`get()`, and its `approve` callback loop (`settle`) auto-decides pauses until the run finishes or returns `'defer'`/a sign-in kind it cannot decide. Expired pauses (`approvalExpired`) are force-denied at decision time — never run with a stale approve.
+
+**Resume** (`resumeAfterApproval` → `resumeObserved`):
+
+1. `store.resolve(decision.id)` — unknown/claimed → `LOUSHO_APPROVAL_NOT_FOUND`. Expired → treated as denied; `reportApprovalExpiry` audits it. `kind: 'sign-in'` → `signInDecision`: re-check the token store, re-park the record and throw `SignInPendingError` if the user never signed in.
+2. `checkApprovalDrift` compares `snapshot.agentFingerprint` with the resuming agent (`onAgentDrift`); a refused resume puts the record back (`restorePause`, M10c).
+3. `clearStaleCheckpoint` deletes the pre-pause checkpoint under `snapshot.sessionId` (read first for `businessState`), so the follow-up `execute()` can't rehydrate stale state — then threading `sessionId`/`checkpointStore` through is safe (LOU-K5).
+4. `decidedToolMessage` produces the paused call's `tool` message: approved → `runApprovedToolCall` re-runs pre/post hooks (`resumedAfterApproval: true`, `approvedArgs` pins the args to what was approved — a hook can't smuggle different input) and executes under a span; denied → `rejectionOf` (`kind: 'denied'`/`'rejected'` per kind); `snapshot.subagent` → `resumeSubagentCall`; approved `transfer_to_*` → `resumeHandoffCall` (switch, not execute).
+5. `replaceToolResult` writes the message into the transcript; `closeUnlistedToolCalls` gives old snapshots' unanswered calls a `not-run` result; `continueResumedRun` calls `AgentExecutor.execute` with `skipSystemPromptInjection`, `initialSteps`, `initialUsage` — the turn's `remainingToolCalls` then run through the normal batch path (LOU-U7), and the run can pause again.
+
+## Design decisions
+
+- **Two stores, two concerns.** `ApprovalStore` (pause + snapshot) vs `CheckpointStore` (run progress): the approval is a *decision waiting to happen*, the checkpoint is *progress so far*. Writing approval first means the checkpoint never dangles a reference to a record that doesn't exist.
+- **Delete-on-read `resolve`.** Exactly-once decisions without a distributed lock; the codebase explicitly accepts the same-sessionId concurrency assumption (see `clearStaleCheckpoint`'s comment) rather than adding locking to stores.
+- **Snapshots store the unextended agent** (`baseAgentOf`) so resume re-runs `extendRunOptions` and picks up current skills/sub-agents/handoffs — consistent with the drift check comparing current config.
+- **TTL is enforced at decision time, not pause time.** A durable store may be read by a different process long after `expiresAt`; making the *decision* expired-safe means no store needs sweeping (CHANGELOG: "draft today, approve tomorrow").
+- **`'question'` and `'sign-in'` are kinds of the same mechanism.** `describeApproval` promotes an `ask_question` call into `kind: 'question'` + parsed `question`, so channels/UIs render one pending-decision shape instead of special-casing tool names.
+- **`store`/approval config is run-level, not agent-level.** A handoff target's `approve`/`approvalStore`/`store` are ignored — `createAgent` warns once via `runLevelOptionNames` → `warnRunLevelOptions` (`src/handoffAgents.ts`), because the *run* owns its approval surface across agents (N6).
+
+## Example
+
+```ts
+const paused = await agent.send('Delete the old backups');
+if (paused.finishReason === 'awaiting-approval') {
+  const [request] = await agent.approvals.list();
+  const result = await agent.approvals.resolve({ id: request.id, approved: true });
+}
+// Executor API:
+// await resumeAfterApproval({ id, approved: true }, approvalStore, toolRegistry, provider, {}, checkpointStore);
+```
+
+## Where next
+
+- [Execution loop](/core/execution-loop) — where `pauseForApproval` fits in the batch.
+- [Durable execution](/core/durable-execution) — the checkpoint half of the pause.
+- [Permission modes](/core/permission-modes) — `ask` rules, `dontAsk`, and the resume-time `planModeRefusal`.
+- [Hooks](/core/hooks) — `resumedAfterApproval` and the approved-args guarantee.

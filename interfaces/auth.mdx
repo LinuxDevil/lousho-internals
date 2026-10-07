@@ -1,0 +1,70 @@
+---
+title: "Auth and principals"
+description: "Route auth entries (jwt/oidc/basic/apiToken/anonymous) → Principal, and how that principal threads into runs, tools, approvals, memory scopes and OAuth credential owners."
+---
+
+`@lousho/build-ai-agent/auth` (N10a) answers two questions per request: may it call, and who is it. A route gets an ordered list of `AuthFn` entries; `routeAuth` walks them and the first `Principal` wins. That principal rides into the run and is the identity tools, permission rules, memory scopes and OAuth credential owners see. Everything is Web Crypto / Fetch only — no `node:*`, no dependencies — so the same helpers run on Node, Workers and edge routes.
+
+## Entry points
+
+| Symbol | File | Role |
+| --- | --- | --- |
+| `Principal`, `AuthFn`, `AuthResult`, `AuthChallenge`, `AuthError(401\|403)` | `src/auth/types.ts` | The contract: `{ id, type: 'user'\|'service', authenticator, issuer?, claims? }`. |
+| `routeAuth(request, auth)` | `src/auth/routeAuth.ts` | Runs the list → `{ ok: true, principal }` or `{ ok: false, response }`. |
+| `jwt(options)`, `verifyJwt`, `jwksKeySource`, `claimsPrincipal` | `src/auth/jwt.ts` | Bearer-JWT verification: `secret` / `publicKey` / `jwksUrl` (exactly one), claim checks, JWKS caching. |
+| `oidc(options)` | `src/auth/oidc.ts` | `jwt()` whose keys come from the issuer's discovery document. |
+| `basic(options)`, `apiToken(token, { id? })`, `anonymous()` | `src/auth/basic.ts` | HTTP Basic, a shared bearer token, explicit open access. |
+| `bearerToken`, `sameDigest`, `sameSecret`, `sha256`, `isTrustedKeyUrl` | `src/auth/encoding.ts` | Constant-time compares and base64/url plumbing shared by the helpers. |
+
+## How it works
+
+**The list walk** (`routeAuth`): each entry returns a `Principal` (accept — later entries are not asked), `null`/`undefined` (skip), or throws `AuthError` (stop with its 401/403). Every entry skipping → a generic `401` carrying one `WWW-Authenticate` header per distinct challenge (`Bearer`, `Basic realm="..."`). An entry that throws anything else or returns a non-principal is a bug: 500, generic body, `console.error`. Response bodies never say which check failed.
+
+**`basic()`**: NFC-normalizes credentials, hashes every configured user/password to SHA-256 digests, and compares all entries with no early exit — an unknown user costs the same as a wrong password. `users` may be a map or a function. Principal: `{ id: user, type: 'user', authenticator: 'basic' }`.
+
+**`apiToken()`**: the `LOUSHO_API_TOKEN` mechanism, constant-time compared; principal `{ id: options.id ?? 'api-token', type: 'service', authenticator: 'api-token' }`. This is what a bare `auth: '<token>'` string becomes in `serveFetch`/`createRouteHandler`/`serverAuth`.
+
+**`jwt()`** (`verifyJwt` under the hood): parse compact JWS → `allowedAlgorithm` refuses `none`, unconfigured algs and `crit` headers → `source.keys(kid)` candidates filtered by `fits()` and capped at 5 → Web Crypto verify → claim checks. Key safety is structural: one `jwt()` has exactly one key source, every algorithm must fit the key's family (`HS`/`RS`/`ES` — a token header can never turn an RSA/EC public key into an HMAC secret), and a JWKS never yields an HMAC key. `exp` is required, `nbf`/`iat` honored, `iss`/`aud` checked when configured; clock tolerance 60 s default, 300 max. RSA keys under 2048 bits are refused. `jwksKeySource` caches a key set for 10 min, refetches at most every 30 s (unknown `kid` included — a token can't force a fetch storm), and drops a set stale >1 h. Default principal: `{ id: sub, type: 'user', authenticator: 'jwt', issuer: iss, claims }`; `options.principal` overrides, `null` skips.
+
+**`oidc()`**: `jwt()` with `source` = `discoveredKeySource(issuer)`: fetches `<issuer>/.well-known/openid-configuration` (or `discoveryUrl`), requires the document's `issuer` to equal the configured one and `jwks_uri` to be https (http only on localhost); discovery failures retry at most every 30 s. Every key URL comes from configuration or the discovered document — never from the token (`jku`/`x5u`/`jwk` headers are ignored).
+
+**Where the principal goes** (N10a/N10b): `serveFetch`, `createRouteHandler` and `createDeployedServer` pass the accepted principal into `handleChatFetch`, which puts it on `session.stream`/`send`/`approvals.streamResolve`. From there it reaches `RunConfigContext` (the `model`/`instructions`/`tools` functions), `MemoryScopeContext`, `ctx.principal` in tools, `needsApproval`/`when` contexts, hooks, `PendingApproval.principal`, and in-process sub-agents (remote ones are not told). Channels set it from the verified sender (`inbound.principal`); the approvals route records the *decider* as `ctx.approval.by` without swapping the run's principal. The principal is frozen before user code sees it, is stored in checkpoints/snapshots (a resumed run keeps its caller — `LOUSHO_CONFIG_INVALID` if continued as another), and never appears in events, spans or error messages.
+
+## Design decisions
+
+- **Skip, don't fail, for a bad credential.** Built-in helpers return `null` on any mismatch, so an ordered list composes (`jwt()` per issuer, then `apiToken` for CI). Only `AuthError` short-circuits, and the outer 401 is deliberately generic — a probe learns nothing about which check it hit.
+- **Algorithm confusion is prevented structurally**, not by configuration discipline: `fits()` binds algorithms to the key's `kty`/`crv`, and the key-set path is RSA/EC-only. Same for key provenance — the JWKS URL is configuration, full stop.
+- **Misconfiguration fails at construction** (`LOUSHO_AUTH_CONFIG_INVALID`): an empty secret, a malformed PEM, `algorithms` that don't fit the key, `audience` missing without `allowAnyAudience`. A helper that could never accept anything is a start-up error, not a silent 401 factory.
+- **Two principals per run, deliberately.** The run's principal is fixed for its whole life (a restart, a resume, an approval by a different user all keep it); the approver is recorded separately. An approver can never launder someone else's grant.
+- **`anonymous()` exists so "open" is a choice.** `createRouteHandler` with no `auth` warns once in production; an explicit `anonymous()` entry says the openness is intended.
+- **Channels reuse the module.** `teamsChannel` verifies Bot Framework JWTs through `oidc()`/`verifyJwt` — one verifier, several callers.
+
+## Example
+
+```ts
+import { createRouteHandler } from '@lousho/build-ai-agent';
+import { jwt, apiToken, basic, anonymous } from '@lousho/build-ai-agent/auth';
+
+export const { GET, POST } = createRouteHandler(agent, {
+  auth: [
+    jwt({ jwksUrl: 'https://auth.example.com/.well-known/jwks.json', issuer: 'https://auth.example.com', audience: 'agent-api' }),
+    apiToken(process.env.CI_TOKEN!, { id: 'ci' }),           // a service principal for automation
+    basic({ users: { ops: process.env.OPS_PASSWORD! } }),     // break-glass, HTTPS only
+  ],
+});
+```
+
+```ts
+// In agent config, the accepted principal is on the run:
+createAgent({
+  instructions: ({ principal }) => `You are helping ${principal?.id ?? 'a guest'}.`,
+  tools: [myTool], // tool sees ctx.principal; needsApproval/permission `when` get it too
+});
+```
+
+## Where next
+
+- [OAuth](/interfaces/oauth) — `principal.id`/`issuer` map to the `TokenOwner` a user credential is stored under.
+- [Server and routes](/interfaces/server-and-routes) — where `routeAuth` runs in the request lifecycle.
+- [Channels](/interfaces/channels) — `inbound.principal` from verified senders; the approver principal on decisions.
+- [Approvals](/core/approvals) — `ctx.approval.by`, `PendingApproval.principal`.

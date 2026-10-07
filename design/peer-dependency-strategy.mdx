@@ -1,0 +1,52 @@
+---
+title: "Optional peers, lazy imports"
+description: "Why the SDK declares 16 peerDependencies (14 of them optional), loads none at import time, and translates a missing package into an exact npm install command."
+---
+
+## The decision
+
+Everything heavy or provider-specific is a *peer*: `package.json` declares 16 of them — `ai` (`^4.3.19 || ^6.0.0 || ^7.0.0`) and zod (`^3.25.76 || ^4.0.0`) required, and the 14 optional ones marked `peerDependenciesMeta.optional: true` (every provider package plus the feature packages `dockerode`, `@modelcontextprotocol/sdk`, `quickjs-emscripten`, `prompts`, react/vue, `tsup`, …). `dependencies` is two packages (`undici`, `yaml`). Each optional peer is loaded by a literal dynamic `import()` on first use — never at module scope — via `loadOptionalPeer()` in `src/providers/optionalPeer.ts`, which turns `MODULE_NOT_FOUND`/`ERR_MODULE_NOT_FOUND` into a `MissingPeerDependencyError` carrying the *exact* `npm install` command.
+
+## Alternatives rejected
+
+- **Real dependencies.** Installing `@lousho/build-ai-agent` would drag in every provider SDK, Docker, QuickJS and React; every consumer pays the install/bundle/audit cost for providers they never use.
+- **Static imports behind "don't import what you don't use".** A static `import '@ai-sdk/openai'` in a reachable module crashes `import '@lousho/build-ai-agent'` for anyone without it — the failure happens at load, before any code runs, with Node's opaque resolution error. `src/providers/importGraph.test.ts` enforces this: every built entry point is loaded under a resolver-recording hook and must never request a peer, `undici`, or `node:sqlite` at import time.
+- **"Install whatever's missing" docs.** A missing peer surfaces as a thrown `MissingPeerDependencyError` (`LOUSHO_PEER_MISSING`) whose `installCommand` is computed from the *installed* `ai` major (`peerInstallCommand`, `src/providers/providerSpec.ts`) — e.g. `@ai-sdk/openai@^0.0.42` on ai 4 but `^4.0.0` on ai 7 — and `FEATURE_PEERS` names the feature that needs it. A missing *transitive* module is deliberately reported as-is: that's a broken install, not a missing peer (`isMissingPackage` checks the failing specifier names the package itself).
+- **Version detection by `require('ai/package.json')`.** The compat layer detects the `ai` major from its exports — `stepCountIs` ⇒ v5+, `registerTelemetry` ⇒ v7 else v6 (`aiMajorOf`, `src/providers/aiSdkCompat.ts`) — which works under bundlers and aliased packages (`ai-v6`, `ai-v7` in devDeps) where package.json probing doesn't.
+
+## Where it shows up
+
+- `src/providers/optionalPeer.ts` — `loadOptionalPeer` (the importer must contain a literal `import('<name>')` so bundlers keep it external), `lazyValue` (caches success, never failure — installing then retrying works), `FEATURE_PEERS`, `MissingPeerDependencyError`.
+- `src/providers/aiSdkCompat.ts` — the ai v4 ↔ v6/v7 compat layer: providers build the request in the v4 shape (`CoreMessages`, `maxTokens`); on modern majors it's mapped (`ModelMessages`, `maxOutputTokens`, `stopWhen`, `inputSchema`, `output`), and both majors' results/streams are normalized to one `GenerateResult`/`StreamChunk`.
+- `src/utils/zodCompat.ts` — zod 3 / zod 4 / Standard Schema: `zod/v4/core` exists in both `zod@^3.25` and `zod@4`, so the SDK's own schemas compile against either; `isZod3Schema` (`_def.typeName`), `isZod4Schema` (`_zod`), `typeErrors`/`anyError` emit each major's error-params shape.
+- `src/deploy/workerSdk.ts` + `src/deploy/bundle.ts` — the worker target is why laziness *and* `node:` discipline matter together: Workers have no Node builtins, so `workerNodeShimPlugin` rewrites `node:*` imports only for a fixed importer allowlist (`createAgent`, `session/sessionStore`, `session/AgentSession`, `projectInstructions`, `tools/mcp/connect`), `workerSandboxShimPlugin` redirects `sandboxCore`/`quickjs-emscripten`, and a post-build leak check fails the bundle if any other reachable module touches `node:`. A `node:` import added to a shared module breaks the worker build — that is the ripple contributors hit.
+- `src/deploy/kv.test.ts` — bundles the KV entry for the browser platform and asserts zero `node:` imports in the graph.
+
+## Trade-offs accepted
+
+- Dynamic `import()` must keep a literal specifier (no variable package names), and its types are `never`-shaped at the compat boundary (`AiSdkModule` uses `options: never`).
+- A *new* `ai` major is not automatically supported — the export-sniffing in `aiMajorOf` must be extended deliberately.
+- Missing-peer errors surface at first *use*, not at `npm install` time — users discover `dockerode` is needed when `SubprocessSandbox` first runs (the error and `lousho doctor` mitigate this).
+- Two package formats + optional peers + dual zod/ai majors is where the cross-copy `instanceof` problem comes from — see [branded types](/design/branded-types).
+
+## Example
+
+```ts
+// src/providers/OpenAIProvider.ts — the idiom every optional peer uses
+private readonly loadProvider = lazyValue(async () => {
+  const { createOpenAI } = await loadOptionalPeer(
+    '@ai-sdk/openai',
+    () => import('@ai-sdk/openai'),
+    aiMajorOf(this.ai),
+  );
+  return createOpenAI(this.config);
+});
+// Missing → MissingPeerDependencyError: "Run: npm install @ai-sdk/openai@^4.0.0"
+```
+
+## Where next
+
+- [AI SDK compat](/providers/ai-sdk-compat) — the v4/v6/v7 mapping in detail.
+- [Provider architecture](/providers/architecture) — the `LLMProvider` contract the peers implement.
+- [Build targets](/ship/build-targets) — the worker/node-server bundling and the `node:` leak check.
+- [Code mode](/tools/code-mode) — `quickjs-emscripten` as a feature peer.

@@ -1,0 +1,86 @@
+---
+title: "OAuth"
+description: "Token storage and the sign-in flow: defineOAuthProvider, ctx.getToken pauses, the PKCE callback, AES-256-GCM sealedTokenStore with key rotation, and user vs app credential owners."
+---
+
+OAuth covers two halves (N9a + N9b): `AgentStore.tokens`, an `OAuthTokenStore` keyed by provider and credential owner, and the flow that fills it — a tool calls `ctx.getToken(provider)`, a missing token throws `SignInRequired`, and the executor turns that into a durable `kind: 'sign-in'` pause carrying the authorization URL. The callback route stores the token; approving the pause runs the tool call again. No token, verifier or code ever reaches an event, error message or log line.
+
+## Entry points
+
+| Symbol | File | Role |
+| --- | --- | --- |
+| `defineOAuthProvider(options)` → `OAuthProvider` | `src/oauth/defineOAuthProvider.ts` | Validated, frozen provider config; registered per-process so `agent.oauth.complete()` finds a sign-in's provider. |
+| `ctx.getToken(provider)` / `ctx.requireAuth(provider)` internals: `getToken`, `requireAuth`, `settleSignInRequired`, `SignInRequired`, `SignInPendingError`, `isSignInRequired` | `src/oauth/signIn.ts` | The tool-facing read; `SignInRequired` pauses the run. |
+| `startSignIn`, `completeSignIn`, `signInRequest`, `signInOwner`, `SIGN_IN_TTL_MS` | `src/oauth/signIn.ts` | The authorization-code + PKCE flow. |
+| `awaitSignInGate(events)` | `src/oauth/signInPending.ts` | Peeks at a decision stream's first event: `SignInPendingError` → `{ pending: true }` (route answers 409). |
+| `redactHandedOutTokens(toolName, result, handedOut)` | `src/oauth/signIn.ts` | Scrubs any token a tool returned in its result. |
+| `createAgentOAuth` → `agent.oauth` (`complete`, `signInUrl`, `mcpSignInUrl`) | `src/oauth/agentOAuth.ts` | Callback completion, app sign-in links, MCP-server OAuth (N9c). |
+| `OAuthTokenStore`, `OAuthToken`, `TokenOwner`, `PendingSignIn`, `OAuthTokenInfo` | `src/oauth/types.ts` | The `tokens` part of `AgentStore`. |
+| `SealedTokenStore`, `SealedRecordBackend`, `cleanToken`, `tokenInfo` | `src/oauth/sealedTokenStore.ts` | Encryption + validation over a backend of opaque sealed strings. |
+| `TokenCipher`, `generateTokenKey`, `TokenKeyInput` | `src/oauth/tokenCipher.ts` | AES-256-GCM via Web Crypto; `LOUSHO_TOKEN_KEY`. |
+| `tokenStoreKey`, `ownerFromKey`, `isValidState`, `assertToken`, `assertPendingInput` | `src/oauth/tokenStoreKey.ts` | Stable, injective record keys. |
+| `MemoryTokenStore` | `src/oauth/memoryTokenStore.ts` | `memoryStore()`'s plain in-process tokens. |
+
+## How it works
+
+**Owners and keys.** `TokenOwner` is `{ owner: 'app' }` or `{ owner: 'user', principalId, issuer? }`; `tokenStoreKey` renders it `<provider>|app` or `<provider>|user|<issuer>|<principalId>` with each component percent-encoded (a `|` in an id can't collide). `signInOwner(principal)` maps route auth's principal → `{ owner: 'user', principalId: principal.id, issuer: principal.issuer }` — the token store's identity is the auth module's identity.
+
+**The read path** (`getToken`): store missing → `LOUSHO_OAUTH_STORE_MISSING` (marked propagating — config errors stop the run, they aren't tool results). Token fresh → returned (with 60 s margin). Expiring with a refresh token → `tokenRequest(grant_type: 'refresh_token')`, stored, returned; failed refresh deletes the record. Nothing usable → `SignInRequired` (user credential) or `LOUSHO_OAUTH_APP_SIGNIN_REQUIRED` (app credential — the operator signs it in, a chat user is never asked). `requireAuth()` is the same throw with `revoke: true` — `settleSignInRequired` deletes the refused token first. `LOUSHO_OAUTH_PRINCIPAL_REQUIRED` when a `credentialOwner: 'user'` provider meets a run with no principal.
+
+**The pause.** `SignInRequired` is checked by name (`LoushoSignInRequired`) because bundling can split class identity; the executor pauses with `kind: 'sign-in'` and `signIn: { provider, displayName, url }` from `signInRequest` → `startSignIn`: 32-byte PKCE verifier + 256-bit `state`, `code_challenge`/S256 on the authorization URL, and a `PendingSignIn` (`{ provider, owner, codeVerifier, redirectUri, approvalId?, data: { sessionId } }`) sealed under `putPending(state, ..., SIGN_IN_TTL_MS)` (10 min).
+
+**The callback** (`completeSignIn` via `GET /oauth/callback` → `agent.oauth.complete`): `takePending` removes `state` once — unknown/used/expired → `LOUSHO_OAUTH_STATE_INVALID`. If an authenticated `principal` is completing a sign-in made for a *different* user, the pending record is put back for its remaining TTL and refused. `error` param → outcome `'declined'` (`markDeclined` flags the pause so approving cancels it). Otherwise `tokenRequest` POSTs the exchange (`client_secret_post` default, `client_secret_basic` supported; PKCE `code_verifier` from the pending record) and `tokens.set(provider, pending.owner, token)`. The callback does not continue the run — `ctx.afterSignIn`/`continueChannelSignIn` resume a channel turn; other surfaces approve the pause (`approvalId`) to retry, and `awaitSignInGate` turns a premature approve into 409/`pending` instead of a failed stream.
+
+**The cipher** (`TokenCipher`/`SealedTokenStore`): AES-256-GCM, fresh 12-byte IV per write, stored as `v1.<b64 iv>.<b64 ct>`; the record key is the AAD, so a ciphertext copied to another record fails `LOUSHO_TOKEN_DECRYPT_FAILED`. Keys come from `tokenKey` or `LOUSHO_TOKEN_KEY` (comma-separated, newest first): writes seal under the first key, `open` tries each in order — rotation is additive. No key configured → `LOUSHO_TOKEN_KEY_MISSING` on use; `generateTokenKey()` makes one. `list()` returns `OAuthTokenInfo` metadata only — never token values. `getClient`/`setClient` hold dynamically registered clients (N9c MCP) in the same sealed space. `SealedTokenStore` wraps a `SealedRecordBackend` of opaque strings so `fileStore`, `SqliteStore` and `KVStore` each supply ~30 lines of storage.
+
+## Design decisions
+
+- **`credentialOwner` is the pivot.** `'user'` (default): one token per signed-in principal, requires a run principal, pauses for the user. `'app'`: one credential for everyone, signed in by the operator via `agent.oauth.signInUrl(provider)` (which refuses user providers); a missing app token is an operator error, never a chat user's prompt.
+- **The provider registry is per-process.** `defineOAuthProvider` registers by name so `completeSignIn` — running in a different request or a different route than the paused run — can resolve the exchange endpoints. A pending sign-in naming a provider this process doesn't know fails `LOUSHO_OAUTH_TOKEN_EXCHANGE_FAILED`.
+- **Single-use, TTL'd `state` replaces route auth on the callback.** A browser redirect can't carry the API token; the callback's protection is that `state` is 256-bit, 10-minute, take-once — and it binds the owner, so a link forwarded to another authenticated user is refused.
+- **`SignInRequired` by name, not `instanceof`.** Two bundled copies of the SDK (agent + host) must still interop, so `isSignInRequired` checks `error.name` and `isOAuthProvider(provider)`.
+- **Defense in depth on leaks.** `handedOut` tracks tokens given to a tool during the call; `redactHandedOutTokens` rewrites them to `[REDACTED]` inside results (and the same for `tool.partial` snapshots). Errors name calls and statuses, never material.
+- **No pause for app credentials.** `settleSignInRequired` returns `{ error }` for `owner: 'app'` — a chat turn can't fix it, and asking would train users to click through someone else's consent.
+
+## Example
+
+```ts
+import { defineOAuthProvider, createAgent, fileStore } from '@lousho/build-ai-agent';
+
+export const github = defineOAuthProvider({
+  name: 'github',
+  displayName: 'GitHub',
+  credentialOwner: 'user',                 // one token per signed-in principal
+  authorizationUrl: 'https://github.com/login/oauth/authorize',
+  tokenUrl: 'https://github.com/login/oauth/access_token',
+  clientId: process.env.GITHUB_CLIENT_ID!,
+  clientSecret: process.env.GITHUB_CLIENT_SECRET,
+  scopes: ['repo'],
+  redirectUri: 'https://agent.example.com/api/agent/oauth/callback',
+});
+
+const agent = createAgent({
+  store: fileStore('./.lousho', { tokenKey: process.env.LOUSHO_TOKEN_KEY }), // required: tokens part
+  tools: [defineTool({
+    name: 'list_issues', /* ... */
+    execute: async (args, ctx) => {
+      const token = await ctx.getToken(github);   // pauses with a sign-in link when absent
+      return fetchIssues(token.accessToken);       // return the API answer, not the token
+    },
+  })],
+});
+
+// Operator, one-off for an app-owned provider:
+console.log(await agent.oauth.signInUrl(appProvider));
+// Callback lands on GET /oauth/callback; then approve the pause:
+const { approvalId } = await agent.oauth.complete({ state, code });
+if (approvalId) await agent.approvals.resolve({ id: approvalId, approved: true });
+```
+
+## Where next
+
+- [Auth](/interfaces/auth) — where `principal` comes from; the `TokenOwner` mapping.
+- [Server and routes](/interfaces/server-and-routes) — `/oauth/callback`, `awaitSignInGate`'s 409, `afterSignIn`.
+- [Channels](/interfaces/channels) — how a sign-in pause is rendered (ephemeral Slack message, Discord follow-up, never a public GitHub comment) and continued.
+- [Approvals](/core/approvals) — the `kind: 'sign-in'` pause mechanics.
+- [Storage stores](/state/storage-stores) — `OAuthTokenStore` backends and `tokenKey`.

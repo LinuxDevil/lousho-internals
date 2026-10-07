@@ -1,0 +1,69 @@
+---
+title: Claude Code projects
+description: How `claudeProject()` reads a repo's Claude-Code-conventional files into `createAgent()` options — and what it deliberately ignores.
+---
+
+`claudeProject(dir)` loads a repository that already carries Claude Code's conventions
+(`CLAUDE.md`, `.claude/rules/`, `.claude/skills/`, `.claude/agents/`,
+`.claude/scratchpad/`) into a `ClaudeProject` object that spreads into `createAgent()`.
+Unlike `loadAgentDir`, **nothing in the directory executes**: every file is read as
+markdown data or YAML frontmatter — the tool surface stays whatever the caller passes
+to `createAgent()`.
+
+## Entry points
+
+- `claudeProject(dir = process.cwd(), options?)` (`src/claude/claudeProject.ts`) — returns `{ instructions?, skills?, subagents?, tools?, manifest }`.
+- `ClaudeProjectOptions` — `provider`/`model` for the `.claude/agents` sub-agents (frontmatter `model` wins), `scratchpad: true` to force the tool, `rules: false` / `agents: false` to skip those folders.
+- `ClaudeProjectManifest` — `instructionFiles`, `rules`, `skills`, `subagents`, `scratchpad`, and `ignored` (conventional entries that exist but aren't loaded).
+
+## How it works
+
+The mapping is one function per convention:
+
+- **`CLAUDE.md` / `AGENTS.md`** → `instructions`. Both are concatenated when present; `AGENTS.md` gets a `## AGENTS.md` heading so its origin stays visible in the merged prompt.
+- **`.claude/rules/*.md`** → appended to `instructions`, one `## <filename>` section each, sorted by filename. Frontmatter is stripped (Claude Code treats rules as always-on); empty bodies are skipped. `rules: false` skips the folder.
+- **`.claude/skills/<name>/SKILL.md`** → `skills`, loaded by the shared `loadSkills()` — the layout is identical, so no adapter exists.
+- **`.claude/agents/*.md`** → `subagents`. `parseAgentFile` requires frontmatter `name` and `description` (Claude Code's own contract) and a non-empty body, which becomes the sub-agent's `instructions`. `model` frontmatter selects that agent's model; otherwise the caller's `provider`/`model` applies — a file with neither throws `LOUSHO_CONFIG_INVALID` naming it. A `tools` frontmatter list is *recorded but not enforced*: Lousho sub-agents share the lead's tool registry, so narrowing is done with permission rules instead.
+- **`.claude/scratchpad/`** → a `scratchpad` tool (`write`/`append`/`read`/`list` of `<name>.md` notes confined to that directory; note names match `[a-z0-9-_]{1,61}`). The directory is created on first write, so `scratchpad: true` can offer the tool before it exists.
+- **`.claude/commands/`, `settings*.json`, `mcp.json`** → listed on `manifest.ignored`, not loaded.
+
+Everything is Node `fs` reads plus `parseYaml` on frontmatter — no `import()`, no
+`createAgent()` until `buildSubagent` constructs each sub-agent from *parsed data* with
+the caller's provider.
+
+## Design decisions
+
+- **Read as data, never executed.** This is the security boundary that separates `claudeProject` from `loadAgentDir`: a repo you don't trust is safe to scan because no file in `.claude/` is imported. Sub-agents are *built* from frontmatter strings, not loaded.
+- **Ignored entries are reported, not dropped.** `manifest.ignored` names `commands`, `settings.json`, `settings.local.json` and `mcp.json` precisely because Claude Code users will wonder where they went — slash commands map conceptually to flows, and MCP config maps to `mcpServers`, but neither is translated automatically (silently mis-translating is worse than listing it).
+- **`tools` frontmatter is advisory.** Claude Code sub-agents may declare a tool list; enforcing it would require a per-agent registry Lousho sub-agents don't have. It lands on the manifest as metadata.
+- **Instructions compose by concatenation.** Rules become `## <file>` sections rather than separate messages so the merged `instructions` stays one system-prompt string — the same shape `createAgent({ instructions })` already takes.
+
+## Example
+
+```ts
+import { createAgent, claudeProject } from '@lousho/build-ai-agent';
+
+const project = await claudeProject('./my-repo', { provider });
+const agent = createAgent({ provider, ...project });
+
+project.manifest.ignored;   // e.g. ['commands', 'settings.json']
+project.manifest.subagents; // names built from .claude/agents/*.md
+```
+
+A `.claude/agents/reviewer.md` like this becomes `subagents.reviewer`:
+
+```markdown
+---
+name: reviewer
+description: Reviews diffs for correctness
+model: openrouter/openai/gpt-4o-mini
+---
+
+You review code ruthlessly. Report findings, never rewrite.
+```
+
+## Where next
+
+- [Agent directories](/compose/agent-directories) — the executing counterpart; contrast its trust model.
+- [Skills](/compose/skills) and [Sub-agents](/compose/subagents) — where the loaded pieces land.
+- User docs: [Claude Code projects](https://lousho.com/claude-projects).

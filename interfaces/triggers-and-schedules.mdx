@@ -1,0 +1,81 @@
+---
+title: "Triggers and schedules"
+description: "Two wake-up mechanisms: the deprecated TriggerAdapter surface (webhook/cron/slack, TriggerRegistry) that channels replaced, and the current cron schedule pipeline — defineSchedule, startSchedules, handleScheduled, specSchedules."
+---
+
+The SDK has two generations of "something wakes the agent". The first is **trigger adapters** (`src/triggers/`, the `@lousho/build-ai-agent/triggers` subpath): a `TriggerAdapter` owns a wake-up mechanism — an HTTP listener, a cron timer, a Slack subscription — and calls `onEvent`. The second, which replaced it, is **channels** for inbound requests and **schedules** for time-based fires; both deprecated adapters delegate to or are superseded by them. The shared cron parser (`cronExpression.ts`) and auth helpers (`webhookAuth.ts`, `slackSignature.ts`) live in `src/triggers/` and are used by both generations.
+
+## Entry points
+
+| Symbol | File | Role |
+| --- | --- | --- |
+| `TriggerAdapter`, `RunnableAgent`, `TriggerContext`, `TriggerHandle` | `src/triggers/types.ts` | The contract: `listen(agent, onEvent) → { stop() }`, optional `reply(channel, message)`. |
+| `TriggerRegistry`, `globalTriggerRegistry` | `src/triggers/TriggerRegistry.ts` | Name → adapter map; deliberately mirrors `ToolRegistry`'s API 1:1 (`register`/`registerMany`/`get`/`has`/`list`/`unregister`/`clear`/`size`). |
+| `WebhookTriggerAdapter`, `CronTriggerAdapter`, `SlackTriggerAdapter` | `src/triggers/adapters/` | **Deprecated.** Webhook delegates auth+parsing to `webhookChannel()`; cron is superseded by `defineSchedule`. |
+| `checkWebhookAuth`, `verifySlackSignature`, `WebhookAuth` (`hmac` \| `bearer` \| `custom`) | `src/triggers/webhookAuth.ts` | `node:crypto` verification; never throws — returns a log-safe reason, the HTTP answer stays generic. |
+| `isFresh`, `precheckSlackSignature`, `checkSlackSignatureWeb` | `src/triggers/slackSignature.ts` | The same Slack scheme on Web Crypto (no `node:*`), so Workers verify too; `crypto.subtle.verify` is constant-time. |
+| `parseCronExpression(expr, timeZone?)` → `CronSchedule` | `src/triggers/cronExpression.ts` | Dependency-free 5-field cron + `@hourly`/`@daily`/`@weekly`/`@monthly`/`@yearly`; `CronExpressionError` names the field. |
+| `defineSchedule(input)`, `isDefinedSchedule` | `src/schedules/defineSchedule.ts` | `{ cron, timezone?, name? }` plus exactly one of `prompt` or `run(ctx)`; validated at definition → `LOUSHO_SCHEDULE_INVALID`. |
+| `startSchedules(agent, schedules, { now?, setTimer?, onError? })` | `src/schedules/startSchedules.ts` | In-process runner; returns `{ stop() }`. |
+| `fireSchedule(agent, schedule, name, firedAt, sessionId?)`, `scheduleName` | `src/schedules/fireSchedule.ts` | One fire: `run({ agent, firedAt, name })` or `agent.send(prompt, { sessionId? })`. |
+| `handleScheduled(agent, schedules, controller, ctx)` | `src/schedules/scheduled.ts` | Cloudflare Workers `scheduled()` handler: matches `controller.cron`, runs inside `ctx.waitUntil`. |
+| `specSchedules(triggers)` | `src/schedules/specSchedules.ts` | AgentSpec `{ type: 'cron', cron, input, name?, timezone? }` → `DefinedSchedule[]`. |
+
+## How it works
+
+**The adapter contract** (`types.ts`): `listen(agent, onEvent)` starts the mechanism and returns a `TriggerHandle` whose `stop()` is the one required lifecycle — a webhook needs its listener torn down, a cron its timer cleared, Slack its subscription closed. `agent` (the `RunnableAgent` `{ send(message) }` shape) and `onEvent` are deliberately separate: a simple caller wires `onEvent` as `agent.send`, while a caller with checkpointing/approval machinery wraps it. Reply semantics differ per adapter — webhook's reply *is* the still-open HTTP response, cron has no caller (results go to a constructor-supplied `onResult` sink), Slack/chat reply over a separate channel — so `reply()` is optional.
+
+**Webhook auth** (`webhookAuth.ts`): `checkWebhookAuth(auth, req, rawBody)` returns `undefined` or a short reason (`'signature mismatch'`, `'stale timestamp'`) — safe to log, never containing secret material. HMAC mode signs the raw body (`x-signature-256: sha256=<hex>` by default, configurable header/algorithm/prefix), and with `timestampHeader` signs `${timestamp}.${body}` and rejects requests outside `toleranceSeconds` (default 300) — replay protection. All comparisons hash both sides to equal length before `timingSafeEqual`. `assertValidWebhookAuth` fails at construction on configs that could never authenticate.
+
+**Cron math** (`cronExpression.ts`): `parseCronExpression` produces `CronSchedule.nextRun(after)` via `Intl.DateTimeFormat` field extraction — DST handled explicitly (a nonexistent wall time is skipped that day; a repeated wall time fires once when the hour field is restricted). Classic Vixie semantics: when both day-of-month and day-of-week are restricted, a day matching *either* fires. Parse also fails fast on impossible schedules (`0 0 31 2 *` never matches a real date within a 10-year scan).
+
+**Schedules** (`src/schedules/`): `startOne` keeps a single timer armed to `nextRun`, recomputing from the previous *scheduled* time so nothing drifts; delays beyond `setTimeout`'s ~24.8-day limit are chained, and timers are `unref`'d so a scheduler alone never keeps the process alive. A fire that overlaps its own still-running previous fire is skipped and reported to `onError`; fires missed while the process was suspended are skipped, not replayed. `handleScheduled` (Workers) instead matches the firing trigger by `controller.cron` (normalized whitespace) and runs prompt schedules under session `schedule-<name>` so runs are readable back from the store.
+
+Wiring: `createDeployedServer(agent, { schedules })` starts them on `listening` and stops on `close`; `resolveAgentDir()` collects `schedules/*.ts` default exports; `specSchedules` converts a spec's `triggers` field; `loadAgentDir()` does not start them — the host does.
+
+## Design decisions
+
+- **`TriggerHandle.stop()` exists because adapters keep something running.** The doc comment in `types.ts` is explicit: `DeploymentAdapter`'s lifecycle is build-time; a trigger's is runtime. That asymmetry is the whole reason the handle type exists.
+- **`agent` and `onEvent` are separate parameters.** An adapter can offer "trigger fires → agent runs" with zero plumbing, while a host like Agent Forge injects checkpointing and abort control through `onEvent`. One interface fits webhook, cron and Slack despite different reply semantics.
+- **Channels replaced triggers for inbound requests.** Triggers had no sessions, no approvals on the surface, no restart-safe decisions. `webhookChannel()` absorbed the webhook adapter's auth/parse; `docs/channels.md` states the migration.
+- **Verification helpers never throw and never echo secrets.** A rejected request is a generic 401 plus an internal reason string; `timingSafeEqual` compares digests so length doesn't leak. Slack's checks are split (`precheckSlackSignature` shared, HMAC per-platform) so Node and Workers share one scheme.
+- **Schedules are fail-fast and non-overlapping.** Validation happens in `defineSchedule` (at load time for agent directories, not at first fire); overlap policy is skip-and-report rather than queue, because a slow `prompt` run shouldn't pile up duplicates.
+- **Everything is injectable for tests.** `now`, `setTimer`, `onError`, `fetch`, clocks — adapters and schedulers take their time and I/O as parameters; tests never sleep.
+
+## Example
+
+```ts
+import { defineSchedule, startSchedules, createDeployedAgent, createDeployedServer } from '@lousho/build-ai-agent';
+
+const schedules = [
+  defineSchedule({ cron: '0 9 * * MON-FRI', timezone: 'Europe/Paris', prompt: 'Summarise yesterday.' }),
+  defineSchedule({
+    name: 'cleanup',
+    cron: '@daily',
+    run: async ({ agent, firedAt }) => { await agent.send(`Clean up, as of ${firedAt.toISOString()}.`); },
+  }),
+];
+
+const running = startSchedules(agent, schedules, {
+  onError: (err, { name }) => metrics.scheduleFailed(name, err),
+});
+// deployed: createDeployedServer(agent, { schedules }) starts/stops them with the server
+```
+
+```ts
+// Verifying a raw webhook by hand (same code webhookChannel() uses):
+import { checkWebhookAuth } from '@lousho/build-ai-agent/triggers';
+
+const reason = await checkWebhookAuth(
+  { type: 'hmac', secret: process.env.WEBHOOK_SECRET!, timestampHeader: 'x-timestamp' },
+  req, rawBody,
+);
+if (reason) { log.warn('rejected', { reason }); res.writeHead(401).end(); }
+```
+
+## Where next
+
+- [Channels](/interfaces/channels) — what replaced the adapters for inbound surfaces.
+- [Server and routes](/interfaces/server-and-routes) — `createDeployedServer` lifecycle (`listening`/`close` → `startSchedules`/`stop`).
+- [Durable execution](/core/durable-execution) — checkpointing that makes channel questions/approvals survive restarts.
+- [Agent directories](/compose/agent-directories) — `schedules/` and `triggers` spec fields.

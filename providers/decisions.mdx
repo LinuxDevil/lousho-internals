@@ -1,0 +1,61 @@
+---
+title: "decide(): the Decisions API client"
+description: "Why decide() is a direct REST call to POST /v1/decisions and not an LLMProvider — typed predicate/choice/score questions, zod-validated answers, and the error-code mapping."
+---
+
+`decide()` (`src/decisions/decide.ts`) calls the OpenAI Decisions API — `POST {baseURL}/decisions` — a purpose-built endpoint that evaluates shared input against typed questions and returns calibrated answers roughly 10× faster than a Responses turn. It is the fast path for the typed-decision pattern (route / gate / score) and **deliberately bypasses the provider layer**.
+
+## Entry points
+
+- `decide(options)` — the only function; `DecideOptions` takes `input`, `questions`, and the injectable `model`, `apiKey`, `baseURL`, `fetch`, `signal`, `timeoutMs` (default 30 s).
+- Question types: `PredicateQuestion`, `ChoiceQuestion`, `ScoreQuestion` (union `DecisionQuestion`).
+- Answer types: `PredicateAnswer` (`probability`), `ChoiceAnswer` (`choice` + per-option `probabilities` + `confidence`), `ScoreAnswer` (`score` = probability-weighted level index + `probabilities` + `confidence`), `RefusalAnswer` (union `DecisionAnswer`).
+- `DecisionInputMessage` — `input` in message form: `input_text` and inline-base64 `input_image` parts only (no hosted URLs or `file_id`).
+- Exported from the package root (`src/index.ts` → `decisions/index.ts`).
+
+## How it works
+
+1. `validateQuestions()` runs first: at least one question, unique non-empty `name`s, `choice` needs ≥ 1 `choices`, `score` needs ≥ 2 `levels` — all `LOUSHO_CONFIG_INVALID`.
+2. Credential: `options.apiKey ?? process.env.OPENAI_API_KEY`; missing → `LOUSHO_PROVIDER_MISSING_API_KEY`.
+3. `request()` POSTs `{ model: options.model ?? 'gpt-6-luna', input, questions }` to `${baseURL}/decisions` (trailing slashes trimmed) with a Bearer header, on `options.fetch ?? globalThis.fetch`. The caller's `signal` and `AbortSignal.timeout(timeoutMs)` are merged with `AbortSignal.any`.
+4. `parseResponse()`: non-OK → `LOUSHO_PROVIDER_RATE_LIMITED` on 429 else `LOUSHO_PROVIDER_REQUEST_FAILED` (body truncated to 300 chars in the message); OK → the body is `safeParse`d by a zod `discriminatedUnion('type')` (`responseSchema`) — probabilities bounded `[0,1]` — and a malformed body is `LOUSHO_PROVIDER_REQUEST_FAILED` naming the first issue.
+5. Abort/timeout on fetch → `LOUSHO_OPERATION_TIMEOUT`; other fetch throws → `LOUSHO_PROVIDER_REQUEST_FAILED` with `cause`.
+
+## Design decisions
+
+- **Not a provider.** The Decisions endpoint is a separate REST surface from chat completions — it takes `input` + `questions`, not `messages`, returns typed distributions instead of text, and serves one beta model (`gpt-6-luna`). Wrapping it as `LLMProvider` would force a generate/stream contract it doesn't have (no tool loop, no prose, no finish reasons that fit). It also can't route through OpenRouter for the same reason.
+- **zod-validated answers.** The response is parsed with `responseSchema` before returning — a beta surface can change shape, and a calibrated `probability` outside `[0,1]` is a bug worth failing on, not passing through.
+- **Injectable `fetch`/`apiKey`/`baseURL`.** Tests never touch the network (`decide.test.ts` injects `fetch`), and `baseURL` supports compatible endpoints. `decide()` reads `globalThis.fetch` per call.
+- **Error codes reuse the provider taxonomy.** Missing key, rate limit, request failure and timeout map onto `LOUSHO_PROVIDER_*`/`LOUSHO_OPERATION_TIMEOUT` so callers and `lousho doctor`-style diagnostics treat it like any model call.
+- **Client-side validation is cheap and early.** Bad `questions` fail before the request is built — no wasted beta-endpoint call.
+- **`AbortSignal.any` composes caller and timeout.** One merged signal covers both `signal` and `timeoutMs` aborts; either reason maps to `LOUSHO_OPERATION_TIMEOUT` since both are indistinguishable from the caller's side.
+
+`decide()` and `createAgent({ output })` answer different questions — see the comparison table in `docs/decisions.md` ("When to use what") before reaching for either.
+
+## Example
+
+```ts
+import { decide } from '@lousho/build-ai-agent';
+
+const { answers } = await decide({
+  input: 'I was charged twice for my order.',
+  questions: [{
+    type: 'choice', name: 'route', instructions: 'Which team handles this?',
+    choices: [
+      { value: 'billing', description: 'Payments, invoices, refunds.' },
+      { value: 'shipping', description: 'Delivery and tracking.' },
+    ],
+  }],
+});
+// answers[0] = { type: 'choice', name: 'route', choice: 'billing',
+//                probabilities: [...], confidence: 0.93 }
+
+// In tests: inject fetch
+await decide({ input: 'x', questions: [...], fetch: async () => new Response('{"answers":[]}') });
+```
+
+## Where next
+
+- [Structured output](/providers/structured-output) — the schema-driven alternative when you need your own JSON shape on any provider.
+- [Provider architecture](/providers/architecture) — what `decide()` deliberately bypasses.
+- User docs: `docs/decisions.md` (question-design guidance, "when to use what").

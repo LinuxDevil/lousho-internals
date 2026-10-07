@@ -1,0 +1,62 @@
+---
+title: "Compaction"
+description: "The two-stage context compaction: prune old tool results, then fold old turns into a model-written summary — as a preGenerate hook that rewrites the live transcript in place."
+---
+
+Compaction keeps a long run under its model's context window in two stages: first replace old tool results with a short marker (cheap, no model call), and only if that's not enough, fold the oldest turns into a summary written by a cheaper model. It ships as an `AgentHook` — no changes to the execution loop — because `ctx.request.messages` *is* the run's transcript array, so the hook rewrites reality in place.
+
+## Entry points
+
+- `createCompactionHook`, `compactMessages`, `prepareCompaction`, `CompactionInput`, `CompactionResult`, `CompactionStrategy`, `CompactionInfo`, `CompactionHookOptions` — `src/context/compaction.ts`.
+- `pruneToolResultsStrategy`, `summarizeStrategy`, `twoPhaseStrategy`, `pinMessage`/`isPinned`, `DEFAULT_SUMMARY_PROMPT`, `SUMMARY_HEADER` — same file.
+- `AgentCompaction`, `AgentCompactionOptions`, `compactionHookFor`, `manualCompactionOptions` — `createAgent({ compaction })` wiring, `src/context/agentCompaction.ts`.
+- `compactTranscript`, `SessionCompactOptions`, `SessionCompactResult` — `session.compact()`, `src/session/sessionCompact.ts`.
+- `estimateTokens`, `setTokenEstimator` — the token counter, `src/models/estimateTokens.ts`; `getModelInfo` (context-window lookup) — `src/models/registry.ts`.
+
+## How it works
+
+**Trigger.** `createCompactionHook` registers `preGenerate`. Before every model call it estimates the tokens of `ctx.request.messages` and acts only above `thresholdTokens = thresholdPercent × contextWindow` (defaults: `0.9`; window from the model registry via `request.model`, else `FALLBACK_CONTEXT_WINDOW` = 128,000; `protectedTokens` default 40,000).
+
+**Stage 1 — `prune-tool-results`.** `protectedTailStart` finds the index of the protected tail: the newest messages fitting `protectedTokens`, extended to cover everything after the last assistant message (results the model hasn't seen are never pruned). Before that index, each `tool` message's content becomes `[pruned: <toolName> result, <n> chars]` — only when the marker is shorter. Pinned, already-marked and short results are skipped, so re-running is idempotent. Assistant messages (and their `toolCalls`) are untouched: every call keeps a result and the transcript stays provider-valid.
+
+**Stage 2 — `summarize`.** `splitForSummary` groups messages before the tail into atomic units — an assistant turn plus its following tool results is one group, kept or folded *whole* — and keeps any group holding a `system` or pinned message. Folded groups are rendered (`renderForSummary`) and sent to `options.model` under `DEFAULT_SUMMARY_PROMPT` (goal / instructions / progress / state / details); the reply replaces them as one `user` message, `SUMMARY_HEADER` + `\n` + summary, spliced at `summaryAt` (the first folded group's position). `twoPhaseStrategy` (what `createAgent({ compaction: { summarizer } })` selects) runs prune first and summarizes only if the pruned result still exceeds `thresholdTokens`.
+
+**In-place commit.** When the strategy returns a different array, the hook `splice`s it into `ctx.request.messages` — which `prepareGenerateRequest` passed as `state.messages` itself. So the compacted transcript is what the next step sees, what `saveStepCheckpoint` persists, and what `ExecutionResult.messages` returns; a pruned result is never pruned twice.
+
+**Failure paths.** A throwing strategy → the run continues uncompacted with `error` reported on `compaction.done`/`onCompaction`. A failing summarizer → falls back to `pruneToolResults` with `error` set. LOU-R11: a summary that doesn't shrink the conversation below the threshold is *rejected* — the transcript array is recorded in a `WeakSet` and compacts prune-only for the rest of that run, so a bad summarizer isn't retried every step.
+
+**Manual compaction.** `session.compact()` → `compactTranscript` runs the same strategies with `thresholdPercent: 0` (always acts), emits `compaction.start`/`compaction.done` with `trigger: 'manual'`, saves the result via the `SessionStore` if anything changed, and returns `SessionCompactResult` (`messagesBefore/After`, `tokensBefore/After`, `strategy`, `error?`). It rejects `LOUSHO_SESSION_BUSY`/`LOUSHO_SESSION_TURN_PENDING`/`LOUSHO_SESSION_AWAITING_APPROVAL` while a turn is in flight or pending.
+
+**Pinned messages.** `pinMessage(message)` sets `metadata.pinned: true`; neither stage prunes or folds it — pin stable facts the run must never lose.
+
+## Design decisions
+
+- **Hook, not loop code.** `preGenerate` sees the real transcript array (`prepareGenerateRequest` hands `state.messages` over, no copy) — one deliberate aliasing decision gives compaction reach into later steps, checkpoints and results for free.
+- **Prune before summarize.** Tool results dominate long transcripts and the model already acted on them; pruning costs nothing. Summarizing costs a model call and loses detail, so it's the fallback — and it prunes first so the summary is smaller and cheaper.
+- **Atomic turn groups in `splitForSummary`.** Folding an assistant message without its tool results would orphan calls and break provider validity; groups keep the invariant structurally, not by convention.
+- **Heuristic tokens.** `estimateTokens` (~4 chars/token Latin, per-message overhead, flat 1,000/image part) is for budgeting, not billing — over-estimating is safe, and `setTokenEstimator` accepts a real tokenizer.
+- **Char counts in markers.** `[pruned: x result, n chars]` tells the model exactly what was removed and lets it re-fetch (re-run the tool) if it turns out to need it.
+
+## Example
+
+```ts
+import { createAgent, compactMessages, twoPhaseStrategy, pinMessage } from '@lousho/build-ai-agent';
+
+const agent = createAgent({
+  model: 'openai/gpt-4o',
+  compaction: { thresholdPercent: 0.8, protectedTokens: 20_000, summarizer: 'openai/gpt-4o-mini' },
+});
+
+// Standalone, on any stored transcript:
+const { messages, tokensBefore, tokensAfter } = await compactMessages(history, { protectedTokens: 8_000 });
+
+// Manual, on a session (events carry trigger: 'manual'):
+const result = await session.compact({ strategy: twoPhaseStrategy({ model: 'openai/gpt-4o-mini' }) });
+```
+
+## Where next
+
+- [Context assembly](/state/context-assembly) — the request this hook rewrites.
+- [Sessions](/state/sessions) — `session.compact()` and what it saves.
+- [Durable execution](/core/durable-execution) — compacted transcripts are what checkpoints persist.
+- [Execution loop](/core/execution-loop) — where `preGenerate` sits in a step.

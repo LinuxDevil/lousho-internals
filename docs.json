@@ -1,0 +1,173 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Lousho Internals",
+  "description": "How the Lousho TypeScript AI agent SDK is built: architecture, design decisions, and contributor onboarding for @lousho/build-ai-agent.",
+  "colors": {
+    "primary": "#0F9D74",
+    "light": "#34D8A6",
+    "dark": "#0B7A5A"
+  },
+  "favicon": "/favicon.svg",
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg",
+    "href": "/introduction"
+  },
+  "appearance": {
+    "default": "dark"
+  },
+  "fonts": {
+    "family": "Inter"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "User docs",
+        "href": "https://lousho.com/introduction"
+      },
+      {
+        "label": "GitHub",
+        "href": "https://github.com/LinuxDevil/agent-sdk"
+      }
+    ],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/LinuxDevil/agent-sdk"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Internals",
+        "icon": "microscope",
+        "groups": [
+          {
+            "group": "Start here",
+            "pages": [
+              "introduction",
+              "architecture",
+              "repo-map",
+              "dev-workflow"
+            ]
+          },
+          {
+            "group": "Execution core",
+            "pages": [
+              "core/execution-loop",
+              "core/run-lifecycle",
+              "core/streaming-events",
+              "core/approvals",
+              "core/permission-modes",
+              "core/hooks",
+              "core/durable-execution",
+              "core/errors"
+            ]
+          },
+          {
+            "group": "Sessions and state",
+            "pages": [
+              "state/sessions",
+              "state/storage-stores",
+              "state/memory",
+              "state/compaction",
+              "state/context-assembly"
+            ]
+          },
+          {
+            "group": "Providers and models",
+            "pages": [
+              "providers/architecture",
+              "providers/model-selection",
+              "providers/ai-sdk-compat",
+              "providers/pi",
+              "providers/decisions",
+              "providers/structured-output",
+              "providers/reasoning"
+            ]
+          },
+          {
+            "group": "Tools",
+            "pages": [
+              "tools/tool-system",
+              "tools/workspace-tools",
+              "tools/hosted-tools",
+              "tools/mcp",
+              "tools/openapi-tools",
+              "tools/tool-search",
+              "tools/code-mode"
+            ]
+          },
+          {
+            "group": "Composition",
+            "pages": [
+              "compose/subagents",
+              "compose/handoffs",
+              "compose/flows",
+              "compose/skills",
+              "compose/agent-directories",
+              "compose/claude-projects"
+            ]
+          },
+          {
+            "group": "Interfaces",
+            "pages": [
+              "interfaces/server-and-routes",
+              "interfaces/ui-bindings",
+              "interfaces/channels",
+              "interfaces/triggers-and-schedules",
+              "interfaces/acp",
+              "interfaces/auth",
+              "interfaces/oauth"
+            ]
+          },
+          {
+            "group": "Ship and distribute",
+            "pages": [
+              "ship/cli",
+              "ship/build-targets",
+              "ship/spec-files",
+              "ship/registry-kits",
+              "ship/create-lousho-agent"
+            ]
+          },
+          {
+            "group": "Quality machinery",
+            "pages": [
+              "quality/testing-mock-model",
+              "quality/record-replay",
+              "quality/evals",
+              "quality/observability",
+              "quality/docs-pipeline",
+              "quality/api-report-and-fallow"
+            ]
+          },
+          {
+            "group": "Design decisions",
+            "pages": [
+              "design/durable-by-default",
+              "design/error-codes",
+              "design/branded-types",
+              "design/peer-dependency-strategy",
+              "design/typed-decisions",
+              "design/flow-vs-loop"
+            ]
+          },
+          {
+            "group": "Contribute",
+            "pages": [
+              "contribute/adding-a-feature",
+              "contribute/code-conventions",
+              "contribute/release-process"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/LinuxDevil/agent-sdk"
+    }
+  }
+}

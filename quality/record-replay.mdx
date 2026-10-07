@@ -1,0 +1,60 @@
+---
+title: "recordReplay: provider cassettes"
+description: "The VCR for LLMProvider: record real model exchanges to a committed JSON cassette, replay them in CI with no network and no API key."
+---
+
+`recordReplay()` wraps an `LLMProvider` so a test runs once against a real model and forever after from a committed cassette file — the mechanism behind every `*.replay.test.ts` in the repo and behind `lousho eval --record/--replay/--drift`.
+
+## Entry points
+
+- `recordReplay(provider | () => provider | undefined, options)` — `src/testing/recordReplay.ts`, exported from `@lousho/build-ai-agent/testing`.
+- Options (`RecordReplayOptions`): `cassette` (path), `mode: 'record' | 'replay' | 'auto'`, `match: 'sequence' | 'request'`, `normalize(request)`, `redact(text)`, `replayTiming`.
+- `CassetteMismatchError` — `LOUSHO_CASSETTE_INVALID`, carries `.cassette` and `.callNumber`; the executor never compacts it into a provider error (LOU-R13).
+- Cassette format code: `src/testing/cassette.ts` (schema + atomic IO); request fingerprinting/redaction: `src/testing/fingerprint.ts`.
+- Real usage: `src/providers/*.replay.test.ts` replay `src/providers/__fixtures__/cassettes/*.json` and `src/__fixtures__/cassettes/`; the matching `*.live.test.ts` re-records them (`LOUSHO_RECORD=1` + `OPENROUTER_API_KEY`).
+
+## How it works
+
+**Modes.** `mode` resolves at construction (`'auto'` = replay iff the file exists). In replay the wrapped provider is never constructed — pass a factory or `undefined`, so CI needs neither the API key nor the peer package. In record, every call is forwarded, appended to an in-memory cassette, and the file is rewritten atomically (temp file + rename in `writeCassette`) after **every** call, so a test that fails midway leaves a valid cassette of everything recorded so far; there is no exit hook.
+
+**Cassette format** (`cassette.ts`, `version: 1`): header `{ version, sdkVersion, recordedAt, provider: { name, defaultModel } }` plus `entries[]` of `{ kind: 'generate'|'stream', request, response? | error? }`. The stored `request` is whitelisted — `model`, `messages` (role, text content, name/toolName/isError, attachment one-liners, tool call names + JSON-normalized args), `tools` (name, description, canonicalized parameter schema), `temperature`, `maxTokens`. `rawResponse` is deliberately never stored (it carries headers and ids). A `stream` response additionally stores `chunks` with `delayMs` per chunk (replayed with `replayTiming`). Provider errors are stored as `{ name, message }` and re-thrown on replay.
+
+**Loading validates, never trusts.** `readCassette` zod-parses the whole file: missing file, invalid JSON, wrong `version` and malformed entries each get a distinct `LOUSHO_CASSETTE_INVALID` message saying how to fix it (usually "re-record"). `sdkVersion` is stamped at record time by walking up from the module dir to the package's `package.json` — written to work in both build formats (`__dirname` in CJS/vitest, `import.meta.url` in `.mjs`, LOU-R10).
+
+**Matching.** Replay reduces the incoming request to the same canonical form and compares. `'sequence'` (default): entry N answers call N and must match. `'request'`: lookup by `stableStringify({kind, request})` fingerprint, for parallel calls. A mismatch throws `CassetteMismatchError` with the first differing path (`firstDifference`) and the re-record hint (`RERECORD_HINT`).
+
+**Fingerprinting** (`fingerprint.ts`): volatile values — timestamps, dates, UUIDs, `call_*/toolu_*/chatcmpl_*` ids — become `<timestamp>`/`<date>`/`<uuid>`/`<id>` placeholders before matching. Zod schemas are canonicalized to a schema fingerprint; zod 4 schemas get the *same* fingerprint zod 3 produces (check kinds remapped), so a cassette recorded under one zod major replays under the other (#333) — which is what keeps the `ai*-zod4` peers jobs green.
+
+**Secret hygiene.** Before anything is written, every string passes through `SECRETS` patterns (`sk-...`, `sk-ant-...`, `Bearer ...`, `AIza...`, `ghp_/gho_/ghs_/github_pat_`, `AKIA...`) → `[REDACTED]`; `redact` adds user patterns on top. Cassettes are meant to be committed and reviewed; `pack-smoke` additionally forbids `__cassettes__/` inside the shipped tarball and scans for secret-looking strings.
+
+**Eval integration.** `lousho eval --record` doesn't call `recordReplay` in test code — `src/evals/cassettes.ts` installs a `setProviderInterceptor()` hook (`src/providers/interception.ts`) so every model call of a case — streamed runs, sub-agents, approval resumes — goes through a per-case wrapper writing `__cassettes__/<eval>/<case>.json`, keyed via `AsyncLocalStorage`.
+
+## Design decisions
+
+- **Whitelist, don't dump.** Only fields that decide what the model says are fingerprinted and stored; everything else (signals, headers, raw responses) is dropped — smaller diffs, fewer false mismatches, fewer secrets.
+- **Match even in sequence mode.** Order alone is not enough: the request must still equal the recording, so a behavioral drift fails loudly instead of silently answering with the wrong response.
+- **Atomic write per call.** Costs a file rewrite per call during recording but means a crashed record run still yields a usable cassette. Writes are chained on a promise (`Recorder.save()`), so overlapping calls serialize; `save()` is a no-op in replay and otherwise only needed to force a write when no call was made.
+- **Errors are entries.** A recorded provider failure replays as a rejection with the same name/message, keeping retry/fallback tests honest.
+- **`match: 'request'` tracks a `used` set.** Each recorded entry serves at most one replayed call, so two identical requests consume two recordings; an aborted `options.signal` is honoured before any lookup.
+
+## Example
+
+```ts
+import { recordReplay } from '@lousho/build-ai-agent/testing';
+
+// Live test file: records when LOUSHO_RECORD=1, replays otherwise.
+const provider = recordReplay(() => resolveProvider('openai/gpt-4o-mini'), {
+  cassette: 'src/providers/__fixtures__/cassettes/n1b-web-search.json',
+  mode: process.env.LOUSHO_RECORD ? 'record' : 'replay',
+  redact: (t) => t.replace(/user-\d+/g, 'user-X'),   // extra hygiene on top of built-ins
+});
+
+// Replay-only test file (CI): the provider factory is never invoked.
+const replay = recordReplay(undefined, { cassette: CASSETTE, mode: 'replay' });
+```
+
+## Where next
+
+- [mockModel](/quality/testing-mock-model) — when a hand-scripted script beats a recording.
+- [Evals](/quality/evals) — `--record`/`--replay`/`--drift` are built on this.
+- [api-report + fallow](/quality/api-report-and-fallow) — `pack-smoke` keeps cassettes out of the published tarball.

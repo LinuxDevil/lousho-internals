@@ -1,0 +1,71 @@
+---
+title: Handoffs
+description: How `handoffs` transfers the whole conversation to another agent mid-run, and how that differs from sub-agent delegation.
+---
+
+A handoff passes the whole conversation to another `createAgent()` agent. Where a
+sub-agent is a tool call whose result comes back to the lead, a handoff is a transfer:
+the run continues as the target — its instructions, model, tools and skills — inside
+the same `send()`/`stream()`, and in a session the target stays the active agent for
+later turns.
+
+## Entry points
+
+- `handoff(target, options)` and `handoffFilters` in `src/handoffs.ts` — the public option objects; a bare agent in `createAgent({ handoffs })` is `handoff(agent)`.
+- `checkHandoffs()`, `handoffRunner()`, `registerHandoffAgent()` in `src/handoffAgents.ts` — validation and per-run resolution of the handoff graph.
+- `src/execution/handoffRun.ts` — executor-side mechanics: `runTools`, `splitHandoffCalls`, `takeHandoffCalls`, `handOff`, `activeAgentOf`.
+
+## How it works
+
+`createAgent()` calls `registerHandoffAgent()` so every agent carries a
+`HandoffRegistration` (`name`, `description`, a `handoffs()` getter, a `resolve()` for
+its spec, and `runLevelOptions`). `checkHandoffs()` enforces: every target is a
+`createAgent()` agent (a `remoteAgent()` is rejected — use it as a sub-agent), has a
+`name` and `description`, names and `transfer_to_<name>` tool names are unique, and no
+agent hands off to itself.
+
+`handoffRunner()` builds the reachable graph per run (BFS over `handoffs()`, names
+unique across it) and resolves `isEnabled` per target, producing `ResolvedHandoff[]`.
+The executor then:
+
+1. Offers each handoff as a `transfer_to_<name>` tool in the model's tool list (`runTools`).
+2. Routes `transfer_to_*` calls through `handoffToolRegistry`, whose descriptor passes the *same gate as any tool call*: permission rules apply (`deny` → `kind: 'denied'` tool error, no handoff; `ask` → the run pauses for approval and the decided call then hands off), hooks may deny or rewrite args, and the decision is audited.
+3. `takeHandoffCalls()` honors only the *first* handoff call of a turn — the rest get `kind: 'not-run'` tool results — and `maxHandoffs` (default 5, `DEFAULT_MAX_HANDOFFS`) caps the run.
+4. `handOff()` writes a tool result carrying `metadata.handoff = { from, to }`, appends a routing system note with the validated arguments, applies `inputFilter`, calls `onHandoff`, and rebuilds the run options for the target.
+
+`activeAgentOf()` scans the transcript's last handoff marker, so session turns,
+`agent.resume()`, `session.resume()` and approval resolution continue as the handed-to
+agent (and the drift check compares against it).
+
+`asTarget()` merges configs: the target keeps its own agent/provider/tools/skills/
+sub-agents/reasoning, while the lead's guardrails and permission rules run *before* its
+own. Everything else — approval/checkpoint/token stores, hooks, `limits`, spend,
+`maxSteps` (counted across agents), signal, `output`, permission mode, principal — stays
+the run's.
+
+## Design decisions
+
+- **Transfer, not delegation.** The handing-off agent never sees the target's answer; the transcript changes hands. Choose handoffs when a specialist should talk to the user; choose sub-agents when the lead needs a result back.
+- **The call is gated like a tool but executed like a transfer.** Letting `transfer_to_*` flow through the normal gate means `permissions`, hooks and approval pause/resume work on handoffs for free — but its "result" is just the `{ transferred_to }` marker record.
+- **Run-level options belong to the entry agent.** A target's `approve`, `approvalStore`, `permissionMode`, `approvalTtlMs` or `store` are never consulted after a handoff — `warnRunLevelOptions()` logs one `console.warn` per target instead of silently dropping them (no warning when the target *is* the lead, i.e. a hand back, where they do apply).
+- **Approvals don't cross a handoff.** `forgetApprovals()` drops `once()`-remembered approvals so a grant never leaks into another agent's context.
+- **Resume keys on the transcript, not state.** The last `metadata.handoff` marker *is* the record of who is active; no separate "current agent" field exists to get out of sync.
+
+## Example
+
+```ts
+const billing = createAgent({ name: 'billing', description: 'Charges, refunds, subscriptions', model: 'openai/gpt-4o-mini', instructions: '...' });
+
+const triage = createAgent({
+  name: 'triage',
+  model: 'openai/gpt-4o-mini',
+  instructions: 'Route the user.',
+  handoffs: [handoff(billing, { inputFilter: handoffFilters.removeToolCalls })],
+});
+```
+
+## Where next
+
+- [Sub-agents](/compose/subagents) — the delegation alternative, and `SubagentSpec` both mechanisms share.
+- [Approvals](/core/approvals) and [Permission modes](/core/permission-modes) — the gate a handoff call passes.
+- User docs: [Handoffs](https://lousho.com/handoffs).

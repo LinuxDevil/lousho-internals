@@ -1,0 +1,66 @@
+---
+title: "Workspace tools"
+description: "The built-in fs/shell/glob tool set: provider interfaces, two-layer path confinement, command policy, checkpointed rewind, and per-key write serialization."
+---
+
+The workspace tools give a coding agent file system and shell access without ever touching `node:fs` or `node:child_process` themselves — they talk to two small provider interfaces (`FsProvider`, `ShellProvider`), so the same tools run against a local directory, an in-memory tree, or a remote sandbox (LOU-X6).
+
+## Entry points
+
+- `src/tools/workspace/types.ts` — `FsProvider`, `ShellProvider`, `Workspace`, `ShellExecOptions`, `ShellExecResult`, `WorkspaceStat`, `WorkspaceDirEntry`.
+- `src/tools/workspace/fsTools.ts` — `createFsTools()`, `FsToolsOptions`, `FsToolApprovals`, `FsToolName`. Builds `read_file`, `write_file`, `edit_file`, `list_dir`, `glob`, `grep`.
+- `src/tools/workspace/shellTool.ts` — `createShellTool()`, `ShellToolOptions`, `CommandPattern`, `ShellToolResult`.
+- `src/tools/workspace/NodeWorkspace.ts` — `NodeWorkspace` (real directory + `child_process`), `MemoryWorkspace.ts` — `MemoryWorkspace` (test double).
+- `src/tools/workspace/SandboxShell.ts` — `SandboxShell`: `ShellProvider` over a `SandboxAdapter` (e.g. `SubprocessSandbox` from `src/security/sandbox.ts`).
+- `src/tools/workspace/paths.ts` — `normalizeWorkspacePath()`, `WorkspaceError`, `joinWorkspacePath()`, `parentWorkspacePath()`.
+- `src/tools/workspace/glob.ts` — `globToRegExp()`, `walkFiles()`; `fsOperations.ts` — `readNumberedLines`, `prepareEdit`/`editFile`, `listDirectory`, `globFiles`, `grepFiles`, `FsLimits`.
+- `src/tools/workspace/checkpoints.ts` — `WorkspaceCheckpoints`, `WorkspaceCheckpointStore`, `MemoryWorkspaceCheckpointStore`, `RewindResult`; `checkpointFileStore.ts` — `FileWorkspaceCheckpointStore`; `keyedQueue.ts` — `KeyedQueue`; `nodeProcess.ts` — `runShellCommand` (internal); `src/security/commandEnv.ts` — `commandEnv`.
+
+## How it works
+
+**Provider split.** `createFsTools(fs, options)` builds six `defineTool()` wrappers over an `FsProvider`; `createShellTool(shell, options)` builds one `shell` tool over a `ShellProvider`. Every path argument is a workspace-relative `/`-separated string. The tools validate paths and catch provider rejections, turning them into `WorkspaceError`s that reach the model as ordinary tool errors — never exceptions that end a run.
+
+**Path confinement has two layers.** `normalizeWorkspacePath()` does lexical normalization shared by every provider: rejects NUL bytes, absolute and UNC paths, drive letters, and any `..` climbing above the root; treats backslashes as separators everywhere so `a\..\..\b` can't sneak a `..` through; on `win32` additionally rejects `:` (drive letters, alternate data streams), reserved device names (`CON`, `NUL`, `COM1`…), and segments made only of dots and spaces (Windows silently strips them — `'.. '` opens `'..'`). `NodeWorkspace.resolve()` then adds the second layer: `realpath` on the deepest existing ancestor, so a symlink inside the root pointing outside is rejected — including for files that don't exist yet — and a *dangling* symlink in the path is refused outright (following it on write could create a file outside the root). `rm` uses `followFinalLink: false` so it deletes a link, never its target.
+
+**The fs tools** are deliberately small and model-ergonomic: `read_file` returns numbered lines (`   12\tcode`) with `offset`/`limit` paging, refuses files over 10 MB and detects binary (`\0`); `edit_file` does exact-match replacement, requiring uniqueness unless `replace_all`, with a CRLF hint on miss; `list_dir` sorts and suffixes directories with `/`; `glob`/`grep` prefer `FsProvider.glob` when a backend offers it, else `walkFiles` does a BFS that never follows symlinks, skips `['.git', 'node_modules']` by default, and stops at `maxFilesScanned` (20k). All outputs are capped (`maxReadLines` 2000, `maxOutputChars` 50k, `maxResults` 200) with explicit truncation markers so the model knows to narrow. `readOnly: true` emits only `read_file`/`list_dir`/`glob`/`grep`. Read tools carry `annotations: { readOnlyHint: true, destructiveHint: false }` (plan mode lets them through); `write_file`/`edit_file` carry `editsFiles: true` (acceptEdits mode).
+
+**The shell tool** is safe by default: `needsApproval` defaults to `true`. `allow`/`deny` `CommandPattern`s are checked *before* approval is ever asked — a denied command is a tool error, not a prompt. String patterns match exactly or as a prefix followed by whitespace, and a command matched only by string patterns may not contain shell operators (`; & | \` $( < >`, newline), so `git status; rm -rf ~` never passes as `git status`. Deny strings are tested against every `;`/`&`/`|`-separated part. The doc comment is blunt: a deny list is a convenience, not a security boundary.
+
+**Process execution** (`nodeProcess.ts`) spawns via the workspace shell (`/bin/sh` or `%ComSpec%`), collects stdout/stderr keeping head + tail up to `maxOutputBytes` (1 MB), and kills the whole process tree on timeout or abort — `taskkill /T /F` on Windows, `process.kill(-pid)` on the detached process group elsewhere. Environment is minimal by default (`commandEnv`: `PATH`, `HOME`, `USERPROFILE`, `TMP/TEMP/TMPDIR`, `LANG`, `TERM`, `LC_*`, plus `SystemRoot`/`ComSpec`/`PATHEXT`/`WINDIR` on Windows); `inheritEnv` adds named variables, `true` passes everything including API keys — flagged in docs as only for trusted commands.
+
+**Sandboxed shell.** `SandboxShell` runs `sh -c "<command>"` through a `SandboxAdapter` — e.g. `SubprocessSandbox` runs each command in a fresh, network-less container that sees only the bind-mounted `cwd`. Abort races a promise against the adapter call so even an adapter that ignores the signal stops being awaited at once. `NodeWorkspace`'s own shell is explicitly **not** a sandbox: a command can do anything the OS user can.
+
+**Checkpoints** (N7): pass `new WorkspaceCheckpoints(fs)` as `createFsTools(fs, { checkpoints })`. `track(ctx, path, write)` captures the file's content and mode *before* the write, runs the write, then appends a `WorkspaceFileBackup` (`sessionId` — `ctx.sessionId` minus a `.turn-<n>` suffix; `turn` — the 0-based index of the user message being answered; `afterHash` — sha256 of what was written). Files over `maxFileBytes` (1 MB) record `omitted: 'too-large'`; a second write to a path already backed up in the same turn records `omitted: 'same-turn'` — only the first backup is needed to rewind. `rewind(toTurn)` restores every file changed in that turn or later: agent-created files are deleted, overwritten files get content + mode back, and a file whose current content no longer matches the last `afterHash` is skipped as `'changed-since'` unless `force`. `dryRun` returns the same `RewindResult` without writing; a real rewind plans every path (reads only) before anything is written. `maxTurns` (20) prunes old turns via `removeBeforeTurn`. `FileWorkspaceCheckpointStore` persists one JSON file per session (rename-with-retry for Windows' EPERM/EBUSY locks; non-name-safe session ids are hashed) so rewind survives a restart.
+
+**Ordering.** `KeyedQueue` (`keyedQueue.ts`) serializes async work per key: `track()` uses it so two writes to the same path never interleave their capture/write/record, and the file store uses it per session file. A 18-line promise-chain queue — each key's tail is the previous task's promise.
+
+## Design decisions
+
+- **Interfaces, not `fs`.** Tools depend on `FsProvider`/`ShellProvider` so E2B/Daytona/Cloudflare backends drop in; a provider exposed to a model must still confine paths itself (`NodeWorkspace` is the reference).
+- **Two-layer confinement.** Lexical checks are cheap and shared; `realpath` catches what lexical analysis can't (symlinks). Neither alone is sufficient.
+- **Policy before approval.** `allow`/`deny` are evaluated in `needsApproval` *and* re-checked in `execute` — a refused command never becomes a human prompt, and approval can't whitelist past it.
+- **Checkpoints are a separate object.** `WorkspaceCheckpoints` wraps any `FsProvider`, works with user-written providers, and restores through the provider's own confinement.
+- **Errors are model-readable.** `WorkspaceError` messages name the workspace path (never host paths) and suggest the fix (`"Use a path relative to the workspace root"`).
+
+## Example
+
+```ts
+import { NodeWorkspace, SandboxShell, SubprocessSandbox, WorkspaceCheckpoints,
+         createFsTools, createShellTool } from '@lousho/build-ai-agent';
+
+const workspace = new NodeWorkspace({ root: './project' });
+const checkpoints = new WorkspaceCheckpoints(workspace);
+
+const tools = [
+  ...createFsTools(workspace, { checkpoints, needsApproval: { write_file: true } }),
+  createShellTool(new SandboxShell(new SubprocessSandbox({ image: 'node:20-alpine' }),
+                                  { cwd: '/abs/path/to/project' }),
+                  { deny: [/\bsudo\b/], needsApproval: (cmd) => !/^git (status|diff|log)\b/.test(cmd) }),
+];
+```
+
+## Where next
+
+- [Tool system](/tools/tool-system) — `defineTool`, approvals, the batch scheduler.
+- [Code mode](/tools/code-mode) — calling these tools from a QuickJS isolate.
+- `docs/workspace-tools.md` — the user-facing security model (credential broker, network egress).

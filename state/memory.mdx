@@ -1,0 +1,62 @@
+---
+title: "Memory"
+description: "Inside defineMemory() slots: scopes and scope keys, the MemoryProvider contract, how recall injects a <memory> block into the system prompt, and the remember_/recall_ tools."
+---
+
+A session remembers one conversation; memory slots are what an agent keeps *across* conversations. `defineMemory()` declares a named, scoped slot backed by a `MemoryProvider`; `createAgent({ memory })` wires each slot into every run as a system-prompt recall block plus two model-facing tools, `remember_<name>` and `recall_<name>`.
+
+## Entry points
+
+- `defineMemory`, `MemorySlot`, `MemoryScope` (`'global' | 'session' | (ctx) => string | undefined`), `MemoryScopeContext`, `DefineMemoryOptions` — `src/memory/defineMemory.ts`.
+- `MemoryProvider` (`list(scopeKey, { limit?, query? })`, `add`, `remove`, `ranking?`), `MemoryItem` — same file.
+- `agentMemory(slots)` → `AgentMemory` (`addTools`, `forRun`), `RunToolRegistry`, `recallHook`, `setBlocks` — `src/memory/withMemory.ts`.
+- `inMemoryMemory`, `itemsProvider`, `MemoryProviderOptions` (`maxItems`, default 1000), `keyedQueue` — `src/memory/providers.ts`, `src/memory/keyedQueue.ts`.
+- `fileMemory({ dir })` — `src/memory/fileMemory.ts`; `sqliteMemory(store)` (table `memory_items`) — `src/storage/sqlite/sqliteMemory.ts`.
+- `inMemoryVectorMemory`, `aiSdkEmbedder` (`ranking: 'relevance'` providers) — `src/memory/vectorProvider.ts`, `src/memory/embeddings.ts`.
+- `kvMemory()`, `bindWorkerMemoryProvider` — `src/deploy/workerMemory.ts`.
+
+## How it works
+
+**Definition.** `defineMemory` validates `name` (`/^[a-zA-Z0-9_-]{1,55}$/` — it becomes a tool-name suffix), checks the provider has `list`/`add`, and returns a frozen `MemorySlot` with defaults: `recall: { onSessionStart: true, maxItems: 10, query: 'none' }`, `expose: { remember: true, recall: true }`.
+
+**Scope resolution, per run.** `agentMemory(slots).forRun(ctx, toolRegistry, hooks)` maps each slot to a scope key: `'global'` → `'global'`; `'session'` → `session:<ctx.sessionId>`; a function scope → whatever it returns from `{ sessionId, metadata, principal }`. A slot with no key (no session, function returned `undefined`) simply does not exist for that run — no recall block, no tools.
+
+**Recall into the prompt.** `forRun` prepends a `memory-recall` `AgentHook` to the run's hooks. On the run's *first* `preGenerate` (skipped for sub-agents via `ctx.subagent`), for every slot with `recall.onSessionStart` it calls `provider.list(key, { limit: maxItems, query })` — `query` is the last user message's text when `query: 'last-input'`. Non-empty lists become `<memory name="...">\n- item text\n</memory>` blocks, and `setBlocks` appends them to `messages[0]` (the system message), regex-replacing blocks of the same names so a resumed run doesn't duplicate. Because session transcripts never store the system message, recall blocks are never persisted.
+
+**The tools.** `memoryTools` builds `remember_<name>` (`{ text }` → `provider.add(key)` → `{ remembered: id }`) and `recall_<name>` (`{ query?, limit? }` → `{ items: [{ id, text, createdAt }] }`, default `limit` = `slot.recall.maxItems`; `readOnlyHint`, so plan mode allows it). Both are bound to *this run's* scope key, registered on a `RunToolRegistry` overlaying the agent's registry, and marked `transient` — so they never appear in the agent fingerprint and a resumed run gets fresh ones rather than a drift warning.
+
+**Providers.** `itemsProvider(store)` implements `MemoryProvider` over a per-key `load`/`save` pair: updates are serialized per scope key via `keyedQueue` (concurrent `remember` calls don't lose items), the stored list is capped at `maxItems` (oldest dropped), and `list` returns newest-first with an optional word-match `query` (3+ letter words, substring match) unless `ranking: 'relevance'`. `fileMemory` stores one JSON file per scope key (atomic temp+rename); `sqliteMemory` keeps the same JSON-array shape in the agent's `SqliteStore` file; `kvMemory` is a deferred provider — a memory module is evaluated at Worker load time, before `env` exists, so `bindWorkerMemoryProvider` swaps it per request for a KV-backed `itemsProvider` on `env[binding]` (default `AGENT_CHECKPOINTS`, keys `memory/<key>`) or falls back to in-memory.
+
+## Design decisions
+
+- **Scope keys, not stores.** One slot definition serves every user/session because the *key* is resolved per run — per-user memory is a scope function reading `ctx.principal` (key on `issuer` + `id`; ids collide across issuers).
+- **Recall lands in the system prompt, not the transcript.** Memory is cross-session state; writing it into the transcript would freeze stale items into one session's saved history. `setBlocks` replaces only same-named blocks, leaving other slots' blocks intact.
+- **Tools are run-local and transient.** Binding `remember_`/`recall_` to a resolved key inside `forRun` means a tool can never write to the wrong scope, and `transient` keeps them out of `fingerprintOf` — otherwise every approval resume would report "agent drift" for missing memory tools.
+- **Two read paths on purpose.** `recall` in the system prompt is ambient (always on, cheap); `recall_<name>` is deliberate search. A provider can declare `ranking: 'relevance'` (vector stores) and only the tool description changes — the contract is identical.
+- **Memory survives `session.clear()`** — slots are cross-session by definition; clearing wipes only the transcript.
+
+## Example
+
+```ts
+import { createAgent, defineMemory, fileMemory } from '@lousho/build-ai-agent';
+
+const preferences = defineMemory({
+  name: 'preferences',
+  description: "the user's preferences: language, tone, tools they like",
+  scope: (ctx) => ctx.metadata?.userId as string | undefined, // per-user memory
+  provider: fileMemory({ dir: './.lousho/memory' }),
+  recall: { maxItems: 5, query: 'last-input' },
+});
+
+const agent = createAgent({ model: 'openai/gpt-4o-mini', memory: [preferences] });
+// First model call of a run: system prompt gains
+// <memory name="preferences">- newest items…</memory>
+// and the model gets remember_preferences / recall_preferences.
+```
+
+## Where next
+
+- [Sessions](/state/sessions) — `scope: 'session'` keys on the session id.
+- [Storage stores](/state/storage-stores) — `sqliteMemory` shares the agent's database file.
+- [Context assembly](/state/context-assembly) — where the `<memory>` block lands in the request.
+- [Durable execution](/core/durable-execution) — why memory tools are `transient`.

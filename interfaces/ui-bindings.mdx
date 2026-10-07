@@ -1,0 +1,73 @@
+---
+title: "UI bindings (React / Vue / Svelte)"
+description: "Why the chat state is one framework-neutral reducer plus runner in src/ui, and how the React hook, Vue composable and Svelte store are thin shells over it."
+---
+
+Every UI binding does the same job: run a turn, fold the versioned `AgentEvent` stream into chat state, expose `send`/`stop`/`approve`/`reject`/`answer`. Instead of implementing that three times, all state logic lives in `src/ui/` — a pure reducer (`reducer.ts`), a run coordinator (`agentRunner.ts`), a stream parser (`parseEventStream.ts`) and a todo projector (`todos.ts`). The bindings in `src/react`, `src/vue` and `src/svelte` only hold the state in their framework's primitive.
+
+## Entry points
+
+| Symbol | File | Role |
+| --- | --- | --- |
+| `reduceAgentEvents(state, event)` | `src/ui/reducer.ts` | Pure `(AgentUIState, AgentEvent \| AgentUIAction) → AgentUIState`. Works with `useReducer`, a `shallowRef` or a hand-rolled store. |
+| `initialAgentUIState`, `AgentUIState`, `AgentUIAction`, `UIMessage`, `UIToolCall`, `UIPendingApproval`, `ApprovalOutcome` | `src/ui/reducer.ts` | The shared state shape and the local `ui.*` actions. |
+| `createAgentRunner(host)` | `src/ui/agentRunner.ts` | The commands: `send`, `stop`, `approve`, `reject`, `answer`, `reset`. `host` supplies `source()`, `options()`, `state()`, `dispatch()`. |
+| `LoushoAgentSource` (`LocalAgentSource { agent, sessionId? }` \| `RemoteAgentSource { url, headers?, fetch? }`), `LoushoAgentOptions { approvalsUrl? }` | `src/ui/agentRunner.ts` | In-process run vs. `POST { input }` to a deployed session API. |
+| `parseEventStream(response)` | `src/ui/parseEventStream.ts` | Reads `AgentEvent`s back from a response body — SSE framing or NDJSON; unknown lines skipped. |
+| `todoView(todos)` → `TodoView` | `src/ui/todos.ts` | Counts, current item and progress from the agent's todo list. |
+| `useLoushoAgent(source, options)`, `useTodos(agent)` | `src/react/` | React: `useReducer(reduceAgentEvents)` + one runner instance; `useEffect` stops the run on unmount. |
+| `useLoushoAgent(source, options)`, `useTodos(agent)` | `src/vue/` | Vue 3: state in a `shallowRef`, each field re-exposed as a `ComputedRef`; `onScopeDispose` stops the run. `MaybeRef` inputs are `unref`'d per turn. |
+| `loushoAgent(source, options)`, `loushoTodos(agent)` | `src/svelte/` | A store implementing `subscribe(run)` by hand — imports nothing from `svelte`, so it works on Svelte 4 and 5. Last unsubscribe stops the run. |
+
+## How it works
+
+`AgentUIState` is `{ messages, status, pendingApproval, error, usage, todos, lastEvent }`. `status` is `idle | streaming | awaiting-approval | error`, derived from `run.done`'s `finishReason` (`settledStatus`). Two kinds of input reach the reducer:
+
+- **`AgentEvent`s from the run** — `text.delta`/`reasoning.delta` append to the last assistant `UIMessage` (created lazily by `onAssistant`), `tool.start`/`resume` add or reset a `UIToolCall` (`running`), `tool.partial` stores a live snapshot (`partial`, only while the call is `running`), `tool.done`/`tool.error` settle it (`done`, `error`, or `rejected` when the error is `ToolRejectedError` — a reviewer's "no"), `approval.requested` pauses into `pendingApproval` (carrying `kind`, `question`, `signIn`, `expiresAt`), `todo.updated` replaces `todos`, `run.done` settles the status and records `usage`.
+- **`AgentUIAction`s from the UI** — `ui.send` appends the user bubble (`describeInput` renders multimodal input as text plus `[image]`/`[file]` markers) and flips to `streaming`; `ui.decide` optimistically marks the call `running`/`rejected`; `ui.resumed` folds a legacy JSON `ApprovalOutcome`; `ui.error`/`ui.stopped`/`ui.reset` handle transport failure, abort and clearing.
+
+`createAgentRunner` owns the side effects. Each `send()`/`decide()` runs under a fresh `AbortController`; once another run starts, the old one's `emit` is dropped (`controller === mine`), so a superseded stream can't corrupt the state. Local mode streams `agent` (or a cached `agent.session({ id })`, one per `{agent, sessionId}` pair, so the conversation persists). Remote mode POSTs `{ input }` to `url` and feeds `parseEventStream(response)` into the same dispatch. Approvals in remote mode POST `{ approved, note }` to `${approvalsUrl}/${approvalId}`; `relayContinuation` handles both the current SSE continuation and an older server's `ApprovalOutcome` JSON.
+
+The todo view is derived, not stored: `todoView` walks `state.todos` (kept from the last top-level `todo.updated`) into `{ todos, counts, current, progress }` — `current` is the `in_progress` item else the first `pending` one.
+
+## Design decisions
+
+- **One reducer, three shells** (LOU-D15, LOU-P2, LOU-P3). The event→state mapping is where the subtlety lives (pause kinds, partial snapshots, sub-agent filtering); framework code is only lifecycle and reactivity. A fix or a new event type lands once, in `src/ui`.
+- **The reducer is pure and synchronous.** No I/O, no timers — so it works identically in React's `useReducer`, a Vue `shallowRef`, a Svelte store and tests (`reducer.test.ts` exercises it without any framework).
+- **Sub-agent events don't bubble.** An event carrying `subagent` only updates `lastEvent` — except `approval.requested`, which still pauses the UI (a sub-agent's pause is still the user's decision). Same rule in `sessionClient.fold` and `uiMessageStream`: sub-agent activity stays inside its parent's tool call.
+- **Optimistic decide, streamed continuation.** `ui.decide` flips the call's status immediately; the real state arrives from the streamed continuation (`streamResolve` locally, SSE remotely). This is why `approvalsUrl` is optional — without it the binding can't decide, and `pendingApproval` is the owner's problem.
+- **Abort is the cancellation primitive, not state.** `stop()` aborts the controller; the reducer sees `ui.stopped` and returns to `idle`. Unmount/dispose paths call `stop`, never `reset` — a remount doesn't lose history, `reset()` does.
+- **`loushoAgent` imports nothing from `svelte`.** The store contract is `subscribe(run) => unsubscribe`; implementing it by hand keeps the entry dependency-free and version-agnostic.
+
+## Example
+
+```tsx
+// React
+import { useLoushoAgent, useTodos } from '@lousho/build-ai-agent/react';
+
+const agent = useLoushoAgent({ url: '/api/agent' }, { approvalsUrl: '/api/agent/approvals' });
+const { progress, current } = useTodos(agent);
+// agent.status, agent.messages, agent.pendingApproval; agent.send/stop/approve/reject/answer
+```
+
+```ts
+// Vue — source may be a ref; a changed url applies to the next turn
+import { useLoushoAgent } from '@lousho/build-ai-agent/vue';
+
+const { messages, status, send } = useLoushoAgent(computed(() => ({ url: apiBase.value })));
+```
+
+```ts
+// Svelte — no svelte import; $store syntax works via subscribe
+import { loushoAgent, loushoTodos } from '@lousho/build-ai-agent/svelte';
+
+const agent = loushoAgent({ agent: myAgent, sessionId: 'demo' }); // local or { url }
+const plan = loushoTodos(agent);
+```
+
+## Where next
+
+- [Server and routes](/interfaces/server-and-routes) — the `POST <base>` / `POST <base>/approvals/:id` wire the remote mode talks to.
+- [Streaming events](/core/streaming-events) — the `v: 1` event schema the reducer consumes.
+- [Approvals](/core/approvals) — what `pendingApproval`, `approve`/`reject`/`answer` decide.
+- [OAuth](/interfaces/oauth) — `pendingApproval.signIn` (`kind: 'sign-in'`) and the "I've signed in" approve loop.

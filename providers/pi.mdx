@@ -1,0 +1,61 @@
+---
+title: "The pi provider"
+description: "PiProvider: a native LLMProvider over @earendil-works/pi-ai — the nested 'pi/<provider>/<model>' spec space, per-nested-provider env credentials, and why pi's own retries stay off."
+---
+
+`PiProvider` (`src/providers/pi/PiProvider.ts`) is the one built-in provider that does **not** go through the `ai` SDK: it adapts `@earendil-works/pi-ai` (the engine `pi-coding-agent` runs on) so pi's whole catalog — OpenRouter, Anthropic, OpenAI, Google, … — is reachable through the same `LLMProvider` surface.
+
+## Entry points
+
+- `createAgent({ model: 'pi/<pi-provider>/<model>' })` / `resolveProvider('pi/...')` — the spec routes to the `pi` registry entry (`builtinProviders.ts`, `providerSpec.ts`).
+- `new PiProvider({ defaultModel, models?, apiKey?, headers?, timeout? })` — direct construction; `PiProviderConfig.models` injects faux/custom catalog entries ahead of pi's built-in list.
+- `pi/messages.ts` — `toPiContext()`: `Message[]` → pi `{ systemPrompt, messages }`.
+- `pi/schema.ts` — `toolParametersToJsonSchema()`: tool parameters → JSON Schema, cached per schema object.
+- `pi/piTypes.ts` — structural types for the pi slice used (deliberately not `import type`-ed: the peer is optional, so shipped `.d.ts` may not name it).
+- `optionalPeer.ts` — `loadOptionalPeer()` + `lazyValue()` do the loading.
+
+## How it works
+
+**Nested specs.** `nestedSpec()` strips an optional leading `pi/` then splits on the first slash: the first segment is the pi provider id, **the rest is the catalog model id verbatim** — `pi/openrouter/openai/gpt-4o-mini` = pi provider `openrouter`, model `openai/gpt-4o-mini`. `resolveModel()` looks the pair up in `config.models` first, then `catalog.getBuiltinModel(provider, modelId)`; unknown providers/models get `LOUSHO_PROVIDER_UNKNOWN` with a `closestMatch` suggestion.
+
+**Lazy peer loading.** `piModules()` (`lazyValue`) loads `@earendil-works/pi-ai/compat` and `/providers/all` together on the first `generate()`/`stream()`; a missing package is `MissingPeerDependencyError` naming `npm install @earendil-works/pi-ai@1.0.3`. A failed load is not cached — installing the package and retrying works.
+
+**Per-nested-provider credentials.** The `pi` entry in `providerSpec.ts` is `envForInfoOnly`: `OPENROUTER_API_KEY` is never injected into the config (it would leak to `pi/anthropic/...`). Instead `compat.getEnvApiKey(provider)` runs pi's own per-provider env resolution at `resolveModel()` time; `config.apiKey` is an explicit override. A missing key becomes the standard `LOUSHO_PROVIDER_MISSING_API_KEY` when the provider's env var is one `NESTED_ENV_NAMES` can name (today: `openrouter`); other nested providers let pi report auth failure at call time.
+
+**Requests.** `callOptions()` builds pi `PiStreamOptions`: `temperature`, `maxTokens`, `timeoutMs`, `signal`, `toolChoice` (`auto`/`none` only — `required`/named rides `samplingParams.tool_choice`), reasoning via `reasoningOptions()` (catalog `reasoning` flag gates it unless `force`; `budgetTokens` → `thinkingBudgets`), and `samplingParams` for OpenAI-compatible extras (`top_p`, penalties, `seed`, `stop`, `response_format` — `json_schema` when a schema is present). **`maxRetries` defaults to 0.**
+
+**Messages** (`messages.ts`): a leading `system` becomes `systemPrompt`; assistant turns become `thinking` parts (reasoning blocks, signature preserved) + text + `toolCall` parts (arguments decoded from our JSON string); `tool` messages → `toolResult` linked by `toolCallId`, `isError` forwarded. pi images are base64-only: `data:` URLs and `Uint8Array`s map, `http(s)` URLs degrade to a `[image ... not sent]` text note with a one-time warning — same for `file` parts (pi has none).
+
+**Tools** (`schema.ts`): `toolParametersToJsonSchema` covers zod 4 / Standard Schema (`schemaToJsonSchema`), raw JSON Schema, `ai.jsonSchema()` wrappers, and hand-converts zod 3 (`zod3ToJsonSchema` — no zod-3 converter exists in the dependency set). Unrecognized nodes collapse to `true`/empty schema — a permissive prompt is a fidelity loss, not a crash.
+
+**Results and streams.** `completeSimple`/`streamSimple` are the calls. `PiAssistantMessage` maps back via `assistantText`/`assistantToolCalls`/`assistantReasoning`/`piUsage` (pi's `cost.total` lands in `ProviderUsage.costUsd`; catalog pricing is also `registerModel()`ed under both `pi/<p>/<id>` and `<p>/<id>` so `estimateCost()` prices the run). `stopReason` maps to our finish reasons, with `'stop'`+toolCall parts coerced to `'tool_calls'`. Streaming maps pi events (`text_delta`, `thinking_delta`/`thinking_end`, `toolcall_end`, `done`, `error`) onto the same `StreamChunk` union the `ai` providers emit; `teeChunks` broadcasts pi's single-consumer event queue so `textStream` and `fullStream` each get their own iterable. `getModels()` lists `<pi-provider>/<model>` for every injected and catalog model; `supportsTools`/`supportsStreaming` are unconditionally `true`.
+
+`PiProvider` also tolerates a full `pi/<provider>/<model>` spec in `GenerateOptions.model` (the executor passes agent settings through), not just in `defaultModel` — `nestedSpec()` strips the redundant prefix either way.
+
+## Design decisions
+
+- **pi's internal retries are pinned off** (`maxRetries: 0` in `callOptions`). `withRetry()`/`withFallback()` are the only retry layer for every built-in provider — two retry layers would double-back-off and `provider.retry` events would under-report.
+- **Node-only.** pi is absent from `WORKER_SUPPORTED_PROVIDERS`; the Worker bundle redirects its specifiers to `deploy/shims/pi.worker.ts` and `cloudflare-worker` builds refuse `pi/...` specs.
+- **No hosted tools.** `assertNoHostedTools` rejects before any request — `LOUSHO_HOSTED_TOOL_UNSUPPORTED`.
+- **Catalog pricing registers into the model registry** so `result.usage.costUsd` works without special-casing `estimateCost()`.
+- **Errors normalize once.** `completeSimple`/`streamSimple` failures wrap into `LLMProviderError` (so `compactProviderError` classifies them like every other provider's); `SDKError`s pass through untouched, and a pi `stopReason: 'aborted'` rethrows the signal's reason as an `AbortError` — `withRetry` then correctly refuses to retry it.
+
+## Example
+
+```ts
+import { createAgent } from '@lousho/build-ai-agent';
+// npm install @earendil-works/pi-ai@1.0.3 ; OPENROUTER_API_KEY=...
+
+const agent = createAgent({ model: 'pi/openrouter/openai/gpt-4o-mini' });
+const result = await agent.send('Summarize this repo.');
+
+// Direct construction with an injected catalog (faux provider in tests):
+import { PiProvider } from '@lousho/build-ai-agent';
+const provider = new PiProvider({ defaultModel: 'openrouter/openai/gpt-4o-mini', models: [fauxModel] });
+```
+
+## Where next
+
+- [Model selection](/providers/model-selection) — the `envForInfoOnly` entry and first-slash spec split.
+- [Provider architecture](/providers/architecture) — where `PiProvider` sits among the adapters.
+- [Reasoning](/providers/reasoning) — how `reasoning` maps onto pi thinking levels.

@@ -1,0 +1,60 @@
+---
+title: "create-lousho-agent and lousho init"
+description: "How npm create lousho-agent scaffolds a project: the thin wrapper package delegating to src/cli/init.ts, the rendered template files, and how the generated project pins the SDK version."
+---
+
+`npm create lousho-agent` is `lousho init`. There is exactly one generator — `src/cli/init.ts` inside the SDK — and the published `create-lousho-agent` package is a thin wrapper that spawns the installed SDK's `lousho` binary with `init` prepended, so the scaffolder and the SDK it scaffolds against always ship on the same version line.
+
+## Entry points
+
+- `packages/create-lousho-agent/bin/cli.js` — the `create-lousho-agent` bin; calls `main(process.argv.slice(2))` and propagates the exit code.
+- `packages/create-lousho-agent/src/index.ts` — `loushoBin()` resolves `@lousho/build-ai-agent`'s `.` export (`require.resolve` — the exports map hides package.json, but `bin/` is a sibling of `dist/`) and finds `bin/lousho.js`; `main(argv)` spawns `node <lousho.js> init <argv>` with `stdio: 'inherit'` and resolves to its exit code. Ships only `dist` + `bin`; deps are the SDK plus `prompts`.
+- `src/cli/init.ts` — `runInit(argv, environment?)`: the real generator, with `InitEnvironment` (env, cwd, TTY detection, SDK manifest, `exec`) injectable for tests.
+- `src/cli/init/options.ts` — `parseInitArgs` (its own `parseArgs`, `InitUsageError` — deliberately not `LOUSHO_CONFIG_INVALID`), `TEMPLATES = minimal | tools | yaml`, `PACKAGE_MANAGERS`, `PROVIDER_NAMES`, `detectPackageManager` (reads `npm_config_user_agent`).
+- `src/cli/init/prompts.ts` — `askMissing`: interactive prompts for what flags didn't say.
+- `src/cli/init/scaffold.ts` — `assertWritable` (non-empty dir → `InitUsageError` unless `--force`), `packageNameFor`, `writeFiles`.
+- `src/cli/init/sdkDependency.ts` — `resolveSdkDependency`: how the generated `package.json` depends on the SDK.
+- `src/cli/init/templates.ts` — `renderProject(config)`: pure config → `Record<path, contents>` (snapshot-tested).
+
+## How it works
+
+`runInit` flows: `parseInitArgs` → `validateFlags` (`expectOneOf` against provider/template/package-manager allowlists) → `resolveChoices` — flags win, then interactive prompts (`askMissing` loads the `prompts` package through `loadOptionalPeer`, only when stdin *and* stdout are TTYs and `--yes` is absent; it asks just the questions flags left open, pre-selected with the defaults and `TEMPLATE_HINTS`), then defaults (`my-agent`, `detectProviderFromEnv` or `openai`, `minimal`; package manager detected from `npm_config_user_agent`) → `assertWritable` → `resolveSdkDependency` → `renderProject` → `writeFiles` → `git init` then `<pm> install` (both non-fatal — a `git init` failure just prints a warning, an install failure prints `INSTALL_FAILED_HINT` pointing at `--sdk-path` for local builds; only a failed install changes the exit code to 1) → print next steps (`cd`, `cp .env.example .env`, `<pm> run dev`).
+
+**What the template renders** (`templates.ts`): `package.json` (`packageNameFor` slugs the dir's base name, `type: module`, `engines.node >=22.19.0`, scripts `dev`/`test`/`typecheck`/`doctor`), `tsconfig.json` (strict NodeNext), `.gitignore`, `.env.example` (the chosen provider's `envKey` — `envForInfoOnly` providers like `pi` get a "credential of the nested provider" hint instead of "API key"), `README.md` (the "next 3 commands"), and an offline `src/agent.test.ts`. Then per template:
+
+- `minimal` — `src/agent.ts` (`createAgent({ model: '<provider>/<defaultModel>', instructions, tools })` with a `current_time` example tool, wrapped in `buildAgent(provider?)` so tests can inject `mockModel`) + `src/index.ts` (a readline chat loop); `dev` script runs `tsx --env-file-if-exists=.env src/index.ts`.
+- `tools` — same, plus `roll_die` and `word_count` tools (`EXTRA_TOOLS`).
+- `yaml` — `agent.yaml` (an `AgentSpec` with `current-date`) + a spec-loading test (`loadSpec` offline); `dev`/`doctor` scripts run `lousho dev agent.yaml` / `lousho doctor agent.yaml` instead.
+
+Dependencies are computed, not fixed: `@lousho/build-ai-agent` (see pinning below), `zod` narrowed to the major the scaffolded provider peer accepts, `ai` + exactly the chosen provider's package at the range pairing with `SCAFFOLD_AI_MAJOR` (currently 7 for openai/anthropic/openrouter/ollama/pi — the pairing matrix in `providerSpec` keeps `ai` major ↔ provider package consistent).
+
+**Version pinning.** Two levels: the `create-lousho-agent` package itself declares `@lousho/build-ai-agent: ^<version>` in lockstep (`scripts/sync-version.mjs` sets both the `VERSION` export and the scaffold pin across releases), so `npm create lousho-agent@x` installs a matched pair. Then `resolveSdkDependency(sdk.version, dir, sdkPath)` — where `sdk.version` is read from the SDK's own `package.json` two levels up (`readSdkManifest`) — writes `^<sdk.version>` into the generated `package.json`: caret-of-the-generating-version, so a scaffold from an unpublished dev version resolves to the nearest published release (the same convention `deployDependencies` uses for `lousho build` output). `--sdk-path`/`LOUSHO_SDK_PATH` switches to local development: a checkout dir is `npm pack`ed into the project (`vendorSdk`/`packSdk`), a `.tgz` is copied verbatim, and the dependency becomes `file:./<tarball>` — anything else is a `ConfigurationError`.
+
+## Design decisions
+
+- **One generator, two front doors.** The logic lives in the SDK so `lousho init` and `npm create lousho-agent` can never drift; the wrapper exists only because npm's `create` convention needs a package named `create-*`.
+- **Templates are pure functions** — `renderProject` maps `ProjectConfig` to strings, so every provider × template combination is snapshot-tested (`init/__snapshots__/templates.test.ts.snap`) rather than exercised end-to-end.
+- **Everything after `writeFiles` is best-effort** — `git init` and `install` failures print hints and continue; the scaffolded files are the product, not the side effects.
+- **Non-interactive is a first-class path** — `--yes` + flags produces a deterministic scaffold for CI; prompts only fill what flags left out.
+- **`init` opts out of the shared CLI parser** — it throws `InitUsageError` (plain message, exit 1) rather than `LOUSHO_CONFIG_INVALID`, a documented exception in the CLI's otherwise uniform error style.
+- **The environment is injectable** — `InitEnvironment` (env, cwd, `interactive`, `sdk` manifest, `exec`) is a parameter with `realInitEnvironment()` as the default, so `init.test.ts` drives the whole flow — prompts, writes, installs — without touching disk or spawning processes.
+
+## Example
+
+```bash
+npm create lousho-agent my-agent -- --provider openrouter --template tools --yes
+# spawns: node <sdk>/bin/lousho.js init my-agent --provider openrouter --template tools --yes
+# -> my-agent/{package.json,tsconfig.json,.gitignore,.env.example,README.md,
+#    src/agent.ts,src/index.ts,src/agent.test.ts}
+#    dependencies: "@lousho/build-ai-agent": "^1.0.0-alpha.15", "ai": "...", "@ai-sdk/openai": "...", "zod": "..."
+# -> git init + npm install + printed next steps (cd, cp .env.example .env, npm run dev)
+```
+
+For an SDK checkout instead of the published package: `lousho init my-agent --sdk-path ../agent-sdk` runs `npm pack` in the checkout, drops the `.tgz` next to the new `package.json`, and writes `"@lousho/build-ai-agent": "file:./lousho-build-ai-agent-<version>.tgz"`.
+
+## Where next
+
+- [The lousho CLI](/ship/cli) — `init`'s place in command dispatch (and its parser exception).
+- [Spec files](/ship/spec-files) — what the `yaml` template's `agent.yaml` is.
+- [Providers](/providers/architecture) — the `SCAFFOLD_AI_MAJOR` pairing and `detectProviderFromEnv`.
+- [Build targets](/ship/build-targets) — where a scaffolded project goes next (`lousho build`).

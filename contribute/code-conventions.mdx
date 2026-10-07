@@ -1,0 +1,34 @@
+---
+title: "Code conventions"
+description: "The patterns that keep 450 files navigable: errors, types, exports, tests, and what not to do."
+---
+
+## Errors
+
+- User-facing failures are `SDKError` with a stable `code` from `src/utils/errorCodes.ts` — the code gets a one-line fix hint and a docs link appended automatically.
+- `appendHelp: false` when the message goes back to the model (tool/provider errors) — the model doesn't need the hint line.
+- Errors carry `detail` (clean message) vs `message` (message + `[code] hint (docs)`).
+
+## Types and validation
+
+- Zod for anything crossing a boundary: tool inputs (`input:` schema, not `parameters`), specs, API responses.
+- Branded types + `Symbol.for` instanceof for values that must survive duplicated SDK copies (see [branded types](/design/branded-types)).
+- Optional heavy deps load through `loadOptionalPeer` — never a static import; missing peers throw `MissingPeerDependencyError` with the exact `npm install` line.
+
+## Style
+
+- Compact, no dead exports — `fallow` gates unused exports and per-function complexity (cyclomatic/cognitive; CRAP uses real coverage).
+- No `any` (lint errors); test helpers use typed fakes.
+- Comments explain *why*; the code says what. Don't delete existing comments.
+
+## Tests
+
+- Offline by default: `mockModel([...])` scripts turns including `{ error }` entries.
+- Fixture dirs use `mkdtemp` — never write into the repo from tests.
+- `*.live.test.ts` guards on env keys; `*.replay.test.ts` replays cassettes; `*.test-d.ts` asserts types.
+
+## Docs and exports
+
+- `docs/*.md` is the source of truth; `E:\agent-sdk-docs` renders it via `scripts/sync-sdk-docs.mjs` (add your page to its `PAGES` map and `docs.json` nav).
+- Example READMEs sync too — an `examples/<name>/README.md` becomes a docs page when mapped.
+- Never commit secrets, API keys, or cassette auth headers; the cassette format is scrubbed, but check `git diff` anyway.

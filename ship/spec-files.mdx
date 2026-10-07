@@ -1,0 +1,60 @@
+---
+title: "Spec files: agent.yaml / agent.json"
+description: "The AgentSpec format under src/spec: loadSpec validation with field-path errors and typo detection, specToAgent's mapping onto createAgent options, and where the spec sits versus code config."
+---
+
+An `AgentSpec` is the declarative, data-only way to describe an agent — `name`, `prompt`, `provider {type, model}`, optional `tools`, `policy`, `triggers`, `mcpServers` — authored as YAML or JSON and turned into a live `createAgent()` agent by `specToAgent()`. It is the input format `lousho dev`, `lousho chat`, `lousho mcp`, `lousho doctor`, and `lousho build` all share.
+
+## Entry points
+
+- `src/spec/schema.ts` — the `AgentSpec` interface and `agentSpecSchema` (zod), kept in lockstep by hand. Published through the structural `SpecSchema`/`SpecObjectSchema` facades (`agentSpecProviderSchema`, `agentSpecPolicySchema`, `agentSpecTriggerSchema`, `mcpServerSpecSchema`) so the public types don't depend on the installed zod major.
+- `src/spec/loadSpec.ts` — `loadSpec(filePath): AgentSpec`, the one loader every consumer uses.
+- `src/spec/specToAgent.ts` — `specToAgent(spec, { store, exporter })`, `resolveSpecProvider(type, model)`, `resolveSpecTool(name)`; `SpecAgent` adds readable `mcpServers`.
+- `src/spec/policy.ts` — `compilePolicy()` → `CompiledPolicy` = `Pick<CreateAgentConfig, 'permissions' | 'guardrails' | 'limits' | 'askQuestion' | 'compaction'>`; `summarizePolicy` backs `lousho doctor`'s spec report.
+- `src/spec/guardrailOptions.ts` — `SPEC_GUARDRAIL_NAMES`, per-name option schemas (`GUARDRAIL_OPTIONS`), `guardrailParts`, `isSpecGuardrailName`.
+- `src/spec/generators/` — spec → *other* harnesses' files (`claude-code.ts`, `codex.ts`, `pi.ts`): the same spec compiles outward, not just into `createAgent()`.
+- `src/spec/index.ts` — the barrel (`schema` + `loadSpec` + `specToAgent` + `policy`), re-exported from the package root.
+
+## How it works
+
+**The schema** (`schema.ts`): required `name`, `prompt`, `provider {type, model}`; optional `tools: string[]`. `policy` validates known fields — `requiresApproval: boolean | string[]`, `guardrails` (entries from `guardrailOptions`), `limits` (a *strict* `runLimitsSchema`: `maxTokens`, `maxCostUsd`, `maxDurationMs`, `maxSteps`, `onExceeded`), `askQuestion`, `compaction: boolean | { thresholdPercent: 0–1 }` — then `.passthrough()`s the rest, because harness-specific fields (Claude Code, Codex, Pi) legitimately differ and the generators read them raw. `triggers` entries are `{ type, ...passthrough }`. `mcpServers` is a record of name → stdio (`command`, `args`, `env`, `approval`, `deferLoading`) or HTTP (`url`, `headers`, `approval`, `deferLoading`, `oauth`): a `superRefine` (`mcpServerProblem`) enforces exactly one of `command`/`url` and no cross-shape fields (`headers`/`oauth` on a stdio entry, `args`/`env` on an HTTP one are named errors), and a `preprocess` upgrades the legacy `[{ name, ... }]` list form to the record. `approval` accepts `'annotations' | 'always' | 'never'` — or a predicate function, reachable only from code, not YAML/JSON. `oauth` requires a URL `redirectUri`, and `clientSecret` without `clientId` is rejected (a secret implies a pre-registered client).
+
+**Loading** (`loadSpec.ts`): missing file → `ConfigurationError` `LOUSHO_SPEC_NOT_FOUND` (never a raw ENOENT); extension picks the parser — `.yaml`/`.yml` via `yaml`, `.json` via `JSON.parse`, anything else `LOUSHO_SPEC_UNSUPPORTED_FORMAT`. Validation is two-layered: `agentSpecSchema.safeParse` failures become `ValidationError` `LOUSHO_SPEC_INVALID` whose message lists every issue as `'<field.path>': <message>` (issue paths and messages normalized by `issuePath`/`issueMessage` in `src/utils/zodCompat.ts`, so the format is stable across zod majors); separately, `unknownFieldTypos()` compares each top-level key against `agentSpecSchema.shape` via `closestMatch` and throws `LOUSHO_SPEC_UNKNOWN_FIELD` with a *did-you-mean* (`promt` → `prompt`) even when the spec would otherwise validate. Unknown fields that aren't typo-close are ignored — forward compatibility by design.
+
+**Becoming an agent** (`specToAgent.ts`): `resolveSpecProvider` routes `openai`/`anthropic`/`ollama`/`openrouter` through `resolveProvider('type/model')` (env-var credentials as usual); any other registered type — notably `mock` — goes straight to `LLMProviderRegistry.create()` (which lazily registers the built-ins, so spec files work in CLI bundles that never load `src/index.ts`). `resolveSpecTool` maps spec tool names to `RESOLVABLE_BUILT_IN_TOOLS` (`http`, `web-fetch`, `current-date`, `day-name`); `github`/`jira` throw `LOUSHO_TOOL_NEEDS_CREDENTIALS` pointing at `createAgent()` code config, and anything else is `LOUSHO_TOOL_NOT_FOUND`. `specToAgent()` then calls `createAgent({ name, prompt, provider, tools, mcpServers, store?, exporter?, ...compilePolicy(policy) })` — `compilePolicy` turns `requiresApproval` into permission rules, `guardrails` into guardrail entries, `limits` into `RunLimits`, `askQuestion` into the built-in tool, and `compaction` into the compaction config; an invalid policy is a `ValidationError`. The returned `SpecAgent` keeps `mcpServers` readable for inspection (`agent.mcpServers`), while `agent.ready()`/`close()` own their lifecycle.
+
+**Spec vs. code config.** A spec is *data*: no functions, no credentials, no arbitrary imports — which is exactly why it's shareable, diffable, deployable by every target, and consumable by `doctor`/`eval` tooling. When you outgrow it (credentialed tools, programmatic approvals, custom stores), you move to a `createAgent()` call or an agent directory's code config (`agent.ts`); an agent directory's *data* config (`agent.json`/`agent.yaml`) is a different, richer schema (`AgentDirConfig` in `src/agentDir/validateConfig.ts` — `model` as one string, `permissions`, `hooks`/`approve` file refs, `store`, …) — don't confuse the two. The deploy adapters deliberately accept only `AgentSpec` files for spec builds (`loadAgentSpecForDeploy` rejects everything but `.yaml`/`.yml`/`.json`).
+
+## Design decisions
+
+- **Interface and schema kept in sync by hand** — zod is already a dependency and no codegen is configured; the `SpecSchema` facade keeps published `.d.ts` files zod-major-agnostic (LOU-V4.2).
+- **Errors name field paths** — `'prompt': Required`, `'mcpServers.fs.env': ...` — because spec files are edited by hand and the fix should be obvious from the message.
+- **Passthrough, not strict** for `policy`/`triggers` — the spec is a cross-harness format; strictness would make every generator's extension a schema change.
+- **No credentials in spec** — deliberately: `github`/`jira` fail loudly instead of silently registering a tool that would die at call time.
+- **Backward-compatible growth** — `policy`, `triggers`, `mcpServers` are all optional, so the original `{name, prompt, provider, tools}` shape still validates unchanged; even the pre-record `mcpServers` list form is preprocessed forward.
+- **One loader, every surface** — `lousho dev`, `chat`, `mcp`, `doctor`, and the node-server/cloudflare adapters all call `loadSpec`, so a spec behaves identically in dev, in diagnostics, and in the deployed artifact.
+
+## Example
+
+```yaml
+name: support-bot
+prompt: You are a friendly support agent.
+provider:
+  type: openai
+  model: gpt-4o-mini
+tools: [current-date, http]
+policy:
+  requiresApproval: [http]
+  limits: { maxSteps: 8 }
+mcpServers:
+  fs: { command: npx, args: ["-y", "@modelcontextprotocol/server-filesystem", "."] }
+```
+
+`loadSpec('support-bot.yaml')` validates it; `specToAgent(spec)` builds the agent — `openai/gpt-4o-mini` via `OPENAI_API_KEY`, `current_date` + `http` tools, `http` approval-gated, `maxSteps` enforced, and the `fs` MCP server connecting on `agent.ready()`. The same file is what `lousho dev support-bot.yaml` serves and what `lousho build support-bot.yaml --target=node-server` deploys.
+
+## Where next
+
+- [Build targets](/ship/build-targets) — `loadAgentSpecForDeploy` and how the spec compiles per target.
+- [The lousho CLI](/ship/cli) — every command that loads a spec.
+- [Configuration](/state/context-assembly) — the `createAgent()` options `compilePolicy` produces.
+- [MCP](/tools/mcp) — what `mcpServers` entries become at runtime.

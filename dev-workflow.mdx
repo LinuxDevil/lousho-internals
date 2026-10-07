@@ -1,0 +1,48 @@
+---
+title: "Dev workflow"
+description: "Clone to green: the local gate loop, test tiers, and what CI runs on every PR."
+---
+
+```bash
+git clone https://github.com/LinuxDevil/agent-sdk.git
+cd agent-sdk
+npm install          # Node >= 22.19
+npm run typecheck    # tsc --noEmit
+npm test             # vitest, fully offline (mockModel + cassettes)
+```
+
+## The gate loop
+
+CI runs these in order; run them locally in the same order to fail fast:
+
+| Command | What it catches |
+|---|---|
+| `npm run lint` | ESLint incl. `no-explicit-any` |
+| `npm run typecheck` + `npm run typecheck:tests` | src and test/type-test compile |
+| `npm test` | Unit + contract suites (offline) |
+| `npm run docs:llms:check` | `llms.txt`/`llms-full.txt` freshness — run `npm run docs:llms` after touching `docs/**`, `README.md`, or `examples/*/README.md` |
+| `npm run api:check` | Public-API surface drift — run `npm run api:update` after touching exports |
+| `npm run docs:verify-snippets` | Every ` ```ts ` block in `docs/` type-checks against `src/`; non-`no-run` snippets also execute |
+| `npm run fallow` | Dead code, duplication, complexity/CRAP gates |
+| `npm run pack-smoke` | npm pack → install → ESM/CJS import → CLI smoke |
+
+The last two pack steps are slow; everything before them takes under a minute.
+
+## Test tiers
+
+- **Unit/contract** — `vitest run`; deterministic, no keys needed.
+- **Replay** — `*.replay.test.ts` replays recorded provider cassettes.
+- **Live** — `npm run test:live` hits real providers when `OPENROUTER_API_KEY`/etc. are set (`vitest.live.config.ts` merges `.env` into `process.env`). Use it to re-validate provider behavior; it re-records cassettes.
+- **Type tests** — `*.test-d.ts` assert the public typing surface.
+- **Coverage** — `npm run test:coverage` regenerates `coverage/`; fallow's CRAP scores consume it, so stale coverage can produce phantom findings.
+
+## Changing code that ships
+
+1. Write/adjust a failing test (suite conventions live next to the code).
+2. Implement; keep the run loop and store contracts intact.
+3. Public API change? → `npm run api:update`, and docs snippet if user-facing.
+4. Doc change? → snippets are verified; ` ```ts ` blocks must typecheck standalone (`no-run`/`no-verify` fences exist for fragments that still should typecheck vs. be skipped).
+5. `npm run docs:llms` if any user-facing doc or README changed.
+6. Changelog under `## [Unreleased]`.
+
+See [adding a feature](/contribute/adding-a-feature) for the full checklist.

@@ -1,0 +1,63 @@
+---
+title: "OpenAPI tools"
+description: "openApiTools(): one tool per OpenAPI operation — document parsing, request building, mutating-op approval defaults, and SSRF pinning."
+---
+
+`openApiTools()` turns an OpenAPI 3.0/3.1 document into `DefinedTool`s — one per operation — that execute real HTTP requests. The document is parsed once at setup; each tool's `execute` only builds the request, sends it, and shapes the response (N8).
+
+## Entry points
+
+- `src/tools/openapi/openApiTools.ts` — `openApiTools()`, `OpenApiToolsOptions`, `OpenApiToolResult` (`{ status, statusText, body }`).
+- `src/tools/openapi/operations.ts` — `parseOpenApiDocument()`, `parseDocumentText()`, `toolNameFor()`, `ParsedOperation`, `OpenApiOperationInfo`, `OperationParameter`. Pure: no network.
+- `src/tools/openapi/privateAddresses.ts` — `privateAddressPolicy()`, `assertHostAllowed()`, `createPinnedFetch()` (SSRF refusal).
+- `src/tools/mcp/schema.ts` — `jsonSchemaToZod()`, shared with MCP tool loading.
+- `src/tools/openapi/index.ts` — the public re-exports.
+
+## How it works
+
+**Document loading.** The `document` argument accepts a parsed object, a JSON or YAML string, or an https URL. URL fetches go through `fetchDocument()`: manual redirect following (max 3 hops, each hop re-checked), `https`-only except loopback, credentials-in-URL rejected, optional private-address check (`privateAddresses: 'refuse'` applies to the document fetch too, not just operation calls). A Swagger 2.x document is rejected with a pointer to `swagger2openapi`; remote `$ref`s are refused — bundle the document so every ref is local (`#/components/...`).
+
+**Parsing** (`operations.ts`). `parseOpenApiDocument` normalizes OpenAPI 3.0's `nullable: true` into JSON Schema (`type: [t, 'null']`, or an `anyOf` around a `$ref`), resolves local `$ref` chains (≤16 hops) for parameters and request bodies, then walks `paths` × the seven methods. Per operation:
+
+- **Name**: sanitized `operationId`, else derived `<method>_<path>` (`get /orders/{id}` → `get_orders_id`); `prefix` option produces `<prefix>__<name>`; everything truncated to 64 chars and checked for collisions up front.
+- **Parameters**: path-level params merge with operation-level (same `in:name` → operation wins); `path`/`query`/`header`/`cookie` kept, `accept`/`content-type`/`authorization`/`host`/`content-length` headers skipped. A name collision across locations renames to `<in>_<name>`.
+- **Body**: only `application/json` (+`*/json`) bodies become an input key (`body`, or `requestBody` on collision); other media types mark the operation `unsupported` — skipped by default, an explicit `include` of one throws.
+- **Description**: `summary` + `description` capped at 1,000 chars, then `METHOD path` appended so the model always sees the wire shape.
+- **Input schema**: one JSON Schema object `{ type: 'object', properties, required }`; `$ref`s inside point into the whole document, which `jsonSchemaToZod(schema, document)` resolves against.
+
+**Tool building.** Each surviving operation becomes a `defineTool()` result. `providedArguments` (app-supplied values — tenant ids, fixed params) are *pruned from the model-facing schema* and re-injected in `execute`, possibly per call via `(ctx) => value`. Approval defaults to `'mutating'`: GET/HEAD/OPTIONS run, everything else asks — `'always'`/`'never'`/`(op) => boolean` override. Annotations follow the method: read-only ops get `readOnlyHint: true`; DELETE gets `destructiveHint: true`.
+
+**Request execution.** `buildUrl` substitutes path params (`encodeURIComponent`, but a whole-segment `.`/`..` is refused — even percent-encoded, since URL parsing resolves `%2E%2E`), serializes query params per `style`/`explode` (form/spaceDelimited/pipeDelimited/deepObject). `buildHeaders` applies parameter headers and cookies first, then configured `headers`/`bearerToken` **last** — a model-supplied `authorization` param can never override configured credentials. Redirects are followed manually, same-origin only (credentials stay on the configured origin), 303/301/302-after-POST downgrade to bodyless GET, max 3 hops. Timeout: `AbortSignal.timeout(timeoutMs ?? 30s)` combined with `ctx.abortSignal` via `AbortSignal.any`. Response → `{ status, statusText, body }`: JSON-parsed when the content-type says so (parse failure keeps text), capped at `maxResponseChars` (50k). Failures throw `toolFailure()` — `LOUSHO_TOOL_EXECUTION_FAILED` with `appendHelp: false`, because the message is the model-facing tool result, not a developer error.
+
+**SSRF pinning.** `privateAddresses: 'refuse'` swaps in `createPinnedFetch()`: an undici `Agent` whose one DNS resolution per connection is checked against private/loopback/link-local ranges *and* is the address the socket connects to — no second lookup for DNS rebinding. IP literals and `localhost` names are checked on the URL itself at build time and on every redirect hop. `allowPrivate` whitelists host patterns; the option can't combine with a custom `fetch` (a custom fetch resolves names itself, so pinning would be unverifiable). Node-only; undici loads lazily.
+
+## Design decisions
+
+- **Parse once, execute dumb.** All spec understanding happens in `openApiTools()`; `execute` is a straight-line request builder — cheaper tools, and the parse step validates the whole selection (`include` typos, name collisions, unused `providedArguments`) before any call.
+- **Schema pruning for secrets.** `providedArguments` removes fields from what the model sees rather than letting the model supply (or guess) values the app overrides anyway.
+- **Approval by HTTP method.** `'mutating'` mirrors the annotations default for MCP tools: read verbs run, write verbs ask — zero-config safe for the common case.
+- **Same-origin redirects only.** Following a cross-origin redirect would forward configured `Authorization` headers to an attacker-chosen host.
+- **Shared `jsonSchemaToZod`.** MCP and OpenAPI both convert remote JSON Schema → zod; one permissive converter (`src/tools/mcp/schema.ts`) keeps behavior identical.
+
+## Example
+
+```ts
+import { openApiTools, createAgent } from '@lousho/build-ai-agent';
+
+const tools = await openApiTools('https://api.example.com/openapi.json', {
+  prefix: 'orders',                    // tools named orders__getOrder, ...
+  include: ['getOrder', 'refundOrder'],
+  bearerToken: () => process.env.ORDERS_TOKEN ?? '',
+  providedArguments: { tenant: 'acme' }, // hidden from the model's schema
+  approval: (op) => op.method === 'DELETE', // custom: only deletes ask
+  privateAddresses: 'refuse',
+});
+
+const agent = createAgent({ model: 'openai/gpt-4o-mini', tools });
+```
+
+## Where next
+
+- [Tool system](/tools/tool-system) — the descriptor contract these tools land in.
+- [MCP](/tools/mcp) — the other spec-to-tools pipeline (shared `jsonSchemaToZod`).
+- `docs/openapi-tools.md` — option reference and large-API guidance.

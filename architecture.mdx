@@ -1,0 +1,53 @@
+---
+title: "Architecture"
+description: "The end-to-end shape of the SDK: one execution loop, pluggable providers, durable stores, and every surface that hangs off it."
+---
+
+`createAgent()` compiles an `AgentConfig` (model, instructions, tools, permissions, stores, hooks) into an agent runtime. A run is a loop: the model emits text or tool calls; tool calls pass the permission gate, hooks, and approval gate; results feed back; the loop ends on text-only finish, approval pause, budget, abort, or error.
+
+## The run loop
+
+```text
+agent.send(input)
+  └─► AgentExecutor (src/execution/AgentExecutor.ts)
+        ├─ assemble context: instructions + projectInstructions + memory recall + transcript
+        ├─ provider.generate(...)            model turn (text | tool calls)
+        ├─ for each tool call:
+        │     permissions rules ─► allow / deny / ask
+        │     hooks.preToolCall  ─► may veto / rewrite args
+        │     ask?               ─► ApprovalGate → durable store → PAUSE
+        │     tool.execute()     ─► zod-validated args
+        │     hooks.postToolCall ─► audit / annotate
+        │     checkpoint         ─► step committed to the store
+        ├─ next turn until finish / maxSteps / budget / abort
+        └─ events emitted on the versioned JSON stream the whole way
+```
+
+Three properties fall out of this shape and explain most of the codebase:
+
+- **Durability is structural, not optional.** Every step checkpoints into an `AgentStore` (memory / files / SQLite / Cloudflare KV). A paused approval is a stored fact, not an in-memory wait — so `agent.resume()` works from another request or another process. See [durable execution](/core/durable-execution).
+- **The model surface is swappable.** `model: 'openai/gpt-4o-mini'` resolves through the provider layer (`src/providers/`): Vercel AI SDK providers for OpenAI/Anthropic/OpenRouter/Ollama, `pi/<p>/<m>` for the Pi catalog, or an injected provider/`mockModel()` for tests. The loop only sees the shared generate/stream contract. See [provider architecture](/providers/architecture).
+- **Everything observable is an event.** Runs emit versioned JSON events (`agentEvents`) which feed SSE, the React/Vue/Svelte bindings, the session client and traces. There is no separate "what happened" channel. See [streaming events](/core/streaming-events).
+
+## What hangs off the loop
+
+| Subsystem | Contribution | Internals page |
+|---|---|---|
+| Permissions + approvals | Gate every tool call; pause durably on `ask` | [approvals](/core/approvals), [permission modes](/core/permission-modes) |
+| Sessions | Multi-turn transcript, forking, pending-turn resume | [sessions](/state/sessions) |
+| Storage | Sessions/checkpoints/approvals/tokens behind `AgentStore` | [storage stores](/state/storage-stores) |
+| Memory + compaction | Scoped recall into the prompt; two-stage context pruning | [memory](/state/memory), [compaction](/state/compaction) |
+| Tools | `defineTool`, registry, workspace/fs/shell, hosted, MCP, OpenAPI, tool search, code mode | [tool system](/tools/tool-system) |
+| Composition | `task` sub-agents, `handoff`, FlowBuilder pipelines, skills, agent dirs, `.claude/` loader | [composition](/compose/subagents) |
+| Interfaces | routeHandler + SSE, UI bindings, channels, triggers, schedules, ACP, auth, OAuth | [interfaces](/interfaces/server-and-routes) |
+| Ship | `lousho` CLI, node-server/docker/worker builds, spec files, registry kits | [build targets](/ship/build-targets) |
+| Typed decisions | `decide()` — the OpenAI Decisions API fast path for classify/route/score | [decisions](/providers/decisions) |
+
+## The two control flows
+
+The SDK deliberately ships **two** ways to sequence model work:
+
+- **The agent loop** — model decides the next step each turn. Open-ended, bounded by `maxSteps`/`limits`/permissions.
+- **Flows** (`FlowBuilder`/`FlowExecutor`) — the harness decides the order deterministically; the model fills `llmCall` nodes; `oneOf` branches on safe expressions. Used for phase pipelines and any "order must be guaranteed" work.
+
+Why both exist is its own page: [flow vs. loop](/design/flow-vs-loop).

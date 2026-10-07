@@ -1,0 +1,65 @@
+---
+title: "Code mode"
+description: "The run_code isolating executor: the model writes JavaScript that calls tools inside a QuickJS WASM isolate — the token-cost rationale and the confinement model."
+---
+
+Chained tool use normally costs one model round-trip per call — each result re-enters the transcript and the whole conversation goes back to the model. With `createAgent({ codeMode })` the model instead writes one short JavaScript program for a `run_code` tool: the script calls tools as `await tools.<name>(args)`, loops and filters locally, and only its `return` value enters the transcript (N14). One model call does the work of N.
+
+## Entry points
+
+- `src/execution/codeMode.ts` — `withCodeMode()` (run-start wiring), `codeModeOption()`/`codeModeOf()` (options ride a `Symbol` key on run options), `assertCodeModeOptions()`, `CodeModeOptions`, `RUN_CODE_TOOL` (`'run_code'`), `nestedToolCaller()`, `NestedToolCaller`, `NestedCallSetup`, `NOT_BY_DEFAULT`.
+- `src/execution/codeModeIsolate.ts` — `loadQuickJS()`, `runScript()`, internal `Script` class, `ScriptLimits`, `ScriptHost`, `ScriptToolResult`, `ScriptError`, `prelude()`.
+- `src/execution/subagentRuntime.ts` — `ToolCallScope.callTool`, `toolCallScopeOf()`/`bindToolCallScope()` (how `run_code`'s `execute` reaches the run's inner-call runner).
+- `src/execution/toolBatch.ts` — `Limiter`, reused to cap a script's concurrent inner calls at the run's `toolConcurrency`.
+- `src/execution/toolCallExecution.ts` — `runToolCall()`: inner calls go through the same gate as direct calls.
+- Optional peer: `quickjs-emscripten` (`loadOptionalPeer`; `lousho doctor` lists it).
+
+## How it works
+
+**Run-start wiring.** `codeModeOption()` stashes the parsed options under `Symbol('lousho.codeMode')` on the run options; spreading options preserves it. `withCodeMode()` runs after tool search in the executor pipeline (`AgentExecutor.ts:683`): it eagerly `loadQuickJS()` (a missing peer fails the run at start, not mid-script), refuses a name clash with an existing `run_code` tool, copies the registry, and registers a `run_code` tool whose **description embeds a TypeScript-like signature per callable tool** — `tools.get_price(args: { pair: string }): Promise<unknown>` rendered by `renderSchema()` over each tool's JSON Schema (`jsonSchemaOf()`), depth-capped at 4. With `exclusive: true` the callable tools are also removed from the model's tool list — they stay in the registry, callable only from scripts.
+
+**Callable set.** Default: every run tool with an `execute`, minus `run_code`, `ask_question`, `task`, `agent_status`/`agent_await`/`agent_cancel`, `tool_search`, `load_skill`, `delegate_to_*`, and deferred tools — anything that asks the user, spawns sub-agents, or loads other tools. `codeMode.tools` narrows to an explicit list.
+
+**The isolate** (`codeModeIsolate.ts`). Each script gets a fresh QuickJS WASM runtime + context: `memoryLimitBytes` (64 MiB), `maxStackSizeBytes` (512 KB), an `interruptHandler` watching the deadline (`timeoutMs`, 30 s, *including* awaited tool calls) and the run's abort signal. The isolate contains only the language: no `require`, `import`, `process`, `fetch`, timers, or host objects. A trusted `prelude()` reads two injected globals (`__lousho_call`, `__lousho_log`), **deletes them from `globalThis`**, builds frozen `tools` and `console` objects, and compiles the model's code as the body of an `AsyncFunction('tools', 'console', code)`. Values cross the boundary as JSON strings only: args stringified in, results parsed out.
+
+**The host drives the event loop.** `settle()` evals the prelude, then loops `executePendingJobs()` — after each pass it checks the script promise's state and waits (`nextEvent`) on the next settled host call, deadline, or abort. `__lousho_call` returns a QuickJS deferred promise; when the host call settles, the deferred resolves/rejects and the script continues. A pending script with nothing in flight is a bug ("waiting for a promise that never settles"). Teardown awaits every in-flight host call before disposing deferreds/context/runtime.
+
+**Inner calls are real tool calls.** `nestedToolCaller()` wraps each script call in a synthetic `ToolCall` (id `<run_code id>:<n>`) and runs `runToolCall()` with the run's context — validation, pre/post hooks, permission rules and modes (plan mode refuses non-read-only inner calls; `run_code` itself advertises `readOnlyHint`), tool guardrails, `needsApproval`, sandbox routing, and the frozen principal all apply unchanged. Events carry `parentToolCallId`; tracing gives each inner call an `execute_tool` span under the `run_code` span (`lousho.tool.parent_call_id`). Concurrency is capped by a `Limiter` at the run's `toolConcurrency`.
+
+**Pauses become in-script errors.** `inScript()` rewrites outcomes that would pause the run — `requiresApproval`, `signIn`, a sub-agent's approval — into ordinary tool errors the script sees (`"Tool X needs approval; call it directly, not from run_code."`). Reason: an isolate can't be checkpointed and resumed, so a pause inside a script could never be honored. A *fatal* outcome (guardrail block, hook throw) is marked `markPropagating` and ends the run, exactly as it would for a direct call.
+
+**Result shaping.** The script's `return` value is JSON-stringified; over `maxOutputChars` (20k, shared with `console.*` logs) the call fails with an error telling the model to filter inside the script — a gentle re-prompt instead of silent truncation. `run_code` returns `{ result, logs, toolCalls }`. `ScriptError` carries a `cause_` of `error|timeout|memory|tool-calls|output|aborted`; script errors include the first 3 non-prelude stack frames plus a trail of the first 5 tool calls with clipped results so the model can see result shapes it guessed wrong.
+
+## Design decisions
+
+- **QuickJS WASM, not `vm`/`eval`/worker threads.** `node:vm` is not a security boundary and shares the host heap; a WASM isolate gives real memory limits and no ambient authority — the only host surface is the two prelude functions.
+- **Full pipeline for inner calls.** Routing through `runToolCall` (not a direct `execute` shortcut) means permissions, guardrails, and tracing can't diverge between "model called it" and "script called it".
+- **Refuse pauses rather than emulate them.** Converting approval/sign-in into script errors keeps `run_code` honest: the model learns to call gated tools directly.
+- **Blocking is acceptable.** A pure-compute script blocks the host event loop until the deadline interrupt fires — simpler than worker handoff, and `timeoutMs` bounds the damage.
+- **Signatures in the description.** Embedding per-tool signatures in `run_code`'s description avoids a second discovery tool; the model writes correct calls in one shot.
+
+## Example
+
+```ts
+const agent = createAgent({
+  model: 'openai/gpt-4o-mini',
+  tools: [getPrice, convert, listAccounts],
+  codeMode: {
+    tools: ['get_price', 'convert', 'list_accounts'],
+    exclusive: true,      // hide them; the model must go through run_code
+    timeoutMs: 10_000,
+    maxToolCalls: 50,
+  },
+});
+// Model emits one run_code call:
+//   const prices = await Promise.all(ids.map(id => tools.get_price({ id })));
+//   return prices.filter(p => p.usd < 100);
+// Transcript gains one tool message, not N.
+```
+
+## Where next
+
+- [Tool system](/tools/tool-system) — `runToolCall`, `toolConcurrency`, the gate inner calls share.
+- [Tool search](/tools/tool-search) — deferred tools are excluded from scripts by default.
+- [Approvals](/core/approvals) — why pause outcomes become script errors.
+- `docs/code-mode.md` — user-facing limits and events reference.

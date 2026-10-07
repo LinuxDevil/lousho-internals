@@ -1,0 +1,62 @@
+---
+title: "Provider architecture"
+description: "The LLMProvider contract, the registry and lazy peer loading, the shared ai-SDK adapter, and the seams (resilience wrappers, interception) every model call passes through."
+---
+
+Every model call in a run goes through one narrow interface, `LLMProvider` (`src/providers/llm.ts`). The built-in providers are thin adapters — four of them over the Vercel `ai` SDK, `pi` over `@earendil-works/pi-ai`, `mock` for tests — and the rest of the SDK (executor, cassettes, retries) only ever sees that contract.
+
+## Entry points
+
+- `LLMProvider` — `src/providers/llm.ts`: `generate()` / `stream()` plus `name`, `defaultModel?`, `supportsTools()`, `supportsStreaming()`, `getModels()`, optional `supportsHostedTool()`. In/Out types are `GenerateOptions`/`GenerateResult` and `StreamResult`/`StreamChunk`.
+- `LLMProviderRegistry` — same file: static `register(name, factory)` / `create(name, config)` / `has()`. `create()` calls `ensureBuiltinProviders()` on a miss, so built-ins resolve from any import path (LOU-R1).
+- `resolveProvider(spec)` — `src/providers/resolveProvider.ts`: `'provider/model'` string → configured instance. Covered in [model selection](/providers/model-selection).
+- `AiSdkProvider` — `src/providers/aiSdkProvider.ts`: abstract base that `OpenAIProvider`, `AnthropicProvider`, `OpenRouterProvider`, `OllamaProvider` and `fromAiSdk()` share.
+- `PiProvider` — `src/providers/pi/PiProvider.ts`: the non-`ai` adapter ([pi](/providers/pi)).
+- `withRetry()` / `withFallback()` — `src/providers/resilience.ts`: `LLMProvider` → `LLMProvider` decorators.
+- `setProviderInterceptor()` — `src/providers/interception.ts`: the single seam where `lousho eval` swaps in cassette providers.
+
+## How it works
+
+```text
+AgentExecutor step
+  └─ interceptProvider(provider)          providers/interception.ts — cassette hook, default passthrough
+       └─ withFallback([p1, p2, ...])     providers/resilience.ts — outermost wrapper
+            └─ withRetry(provider)         backoff, retryOn classification, provider.retry events
+                 └─ AiSdkProvider subclass  builds v4-shaped request → aiSdkCompat.ts → ai.generateText/streamText
+                 └─ PiProvider              nested spec → pi-ai compat.completeSimple / streamSimple
+                 └─ MockLLMProvider         canned responses
+```
+
+- **Shared adapter.** `AiSdkProvider` does message conversion (`toCoreMessages`: assistant tool-call turns → `tool-call` parts, `tool` messages → `tool-result` parts linked by `toolCallId`, multimodal parts on user messages), tool conversion (`convertTools`, with a placeholder `execute` — real execution is the executor's job), and builds a v4-shaped `AiSdkCallSettings`. It never imports an optional peer at module scope: subclasses load `@ai-sdk/openai`, `@ai-sdk/anthropic`, `ollama-ai-provider(-v2)` lazily via `loadOptionalPeer()` inside a `lazyValue()` on first `createModel()`.
+- **The compat boundary.** `compatGenerateText()` / `streamCompat()` in `aiSdkCompat.ts` take that one v4-shaped request and send it on the installed `ai` major (4, 6 or 7). See [ai-sdk compat](/providers/ai-sdk-compat).
+- **Lazy registration, acyclic graph (LOU-R27).** `llm.ts` imports `builtinProviders.ts`; the provider classes only `import type` from `llm.ts`; `providerSpec.ts` receives the registry as an argument. Nothing in the registration path imports `llm.ts` back, so `import { createAgent }` works under true ESM.
+- **Resilience as providers.** `withRetry` and `withFallback` return `LLMProvider`s, so they compose with specs, mocks and `fromAiSdk()`. `createAgent()` resolves string models with `maxRetries: 0` (the `ai` SDK's own retries off) and wraps with `withRetry({ maxRetries: 2 })` itself — one retry layer, not two (`resolveModelSource`, `src/createAgent.ts`). Retries/fallbacks report through a symbol-keyed listener on the request (`providerEvents.ts`) as `provider.retry` / `provider.fallback` events.
+- **Interception.** `generateInSpan()` (`src/execution/generateStep.ts`) routes every call through `interceptProvider()`, so `lousho eval --record/--replay` covers top-level runs, streamed steps, sub-agents and approval resumes with one hook stored on `globalThis` (both bundle builds share it).
+
+## Design decisions
+
+- **One request shape internally.** Providers build the `ai` v4 request shape and `aiSdkCompat` maps it for newer majors — one code path to maintain, majors differ only at the wire boundary.
+- **Optional peers, always lazy (LOU-D10/D19).** Importing the SDK loads zero provider packages; a missing one surfaces as `MissingPeerDependencyError` (`LOUSHO_PEER_MISSING`) with the exact `npm install` command for the installed `ai` major.
+- **`undefined` usage, never zeros.** Providers that report nothing leave `GenerateResult.usage` unset; the executor then estimates and marks the run `usage.estimated`. Zeros would look reported.
+- **`maxSteps`/`stopWhen` is pinned to 1.** Tool execution happens in `AgentExecutor`, not inside the SDK call — every provider call is exactly one model turn.
+- **Errors compacted once.** Provider errors are normalized by `compactProviderError()` (`src/execution/errors.ts`) into `CompactedLLMProviderError`; `withRetry`'s default `retryOn` reads that classification (rate limits/timeouts/5xx retryable, auth/invalid-request not).
+
+## Example
+
+```ts
+import { LLMProviderRegistry, resolveProvider, withRetry, withFallback } from '@lousho/build-ai-agent';
+
+const primary = withRetry(resolveProvider('openai/gpt-4o-mini'), { maxRetries: 3 });
+const backup = withRetry(resolveProvider('anthropic/claude-3-5-haiku-latest'));
+const provider = withFallback([primary, backup]);
+
+// A custom provider is just the interface:
+LLMProviderRegistry.register('mine', (config) => new MyProvider(config));
+```
+
+## Where next
+
+- [Model selection](/providers/model-selection) — how `'provider/model'` strings and env vars resolve.
+- [ai-sdk compat](/providers/ai-sdk-compat) — the v4/v6/v7 + zod 3/4 compatibility layer.
+- [pi](/providers/pi) — the non-`ai` provider and its nested spec space.
+- [recordReplay](/quality/record-replay) — the consumer of the interception seam.

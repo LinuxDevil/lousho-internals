@@ -1,0 +1,98 @@
+---
+title: Flows
+description: FlowBuilder shapes an `AgentFlow`, FlowExecutor runs its node graph, and `evaluateSafeExpression` powers conditions without eval.
+---
+
+Flows run a fixed node graph — steps and their order written down up front instead of
+left to the model. `FlowBuilder` produces an `AgentFlow` document; the static
+`FlowExecutor.execute(flow, context, onEvent?)` interprets it against a plain agent
+config, a provider and a variables bag.
+
+## Entry points
+
+- `FlowBuilder` (`src/flows/FlowBuilder.ts`) — metadata builder: `setCode`/`setName`/`setInputs`/`setFlow`/`addAgent` then `build()`; both `code` and `name` are required and input names must be unique.
+- `FlowExecutor` (`src/flows/FlowExecutor.ts`) — stateless static executor; `execute()` returns `{ success, output, variables, steps, events, error? }`.
+- `evaluateSafeExpression` / `ExpressionError` (`src/flows/safeExpression.ts`) — the condition/`evaluator` language.
+- `validateFlow`, `isCreateAgentResult` (`validators.ts`); `injectVariables`, `createDynamicZodSchemaForInputs`, `validateFlowInput` (`inputs.ts`) — the latter group targets a separate agent-style flow format (`{ agent: 'sequenceAgent', input: ... }`) with `@var` substitution; `FlowExecutor` never reads it.
+- Node shapes in `src/types/flow.ts`: `EditorStep = EditorShapeStep | RuntimeStep`.
+
+## How it works
+
+`execute()` wraps the run in an `invoke_workflow` span, then `executeNode()` dispatches
+each node through `nodeHandlers`, a `Map` of one handler per `type` (populated from
+`handlersByType`, so narrowing by `node.type` picks the right node shape). Every node
+runs inside a `flow.node {type}` span and a `step-start`/`step-complete`/`step-error`
+event bracket; `steps` in the result counts `step-complete` events.
+
+Executor-side nodes (`RuntimeStep`):
+
+| `type` | Handler reads | Result |
+| --- | --- | --- |
+| `sequence` | `steps[]` | last step's result |
+| `parallel` | `steps[]` | `Promise.all` results array — first rejection fails the flow |
+| `oneOf` | `options[]` (`{ condition?, step }`) | first matching option's step result; `null` if none; no `condition` = default |
+| `forEach` | `items`, `itemVariable`/`indexVariable` (default `item`/`index`), `step` | array of per-item results |
+| `evaluator` | `expression` | `evaluateSafeExpression` value |
+| `llmCall` | `prompt`, `model`, `temperature`, `maxTokens`, `outputVariable` | generated text; `agent.prompt` becomes the system message |
+| `toolCall` | `tool`, `arguments`, `outputVariable` | tool result; `requiresSandbox` tools route through `context.sandbox ?? NoopSandbox` |
+| `setVariable` | `variable`, `value` | the stored value |
+| `return`, `end` | `value` | the resolved value |
+| `throw` | `message` | throws `Error` (interpolated) |
+
+Variables: `context.variables` is shallow-copied at flow start and mutated by
+`setVariable`/`outputVariable`/`forEach` loop vars — visible to every later node.
+`resolveValue()` treats a string starting with `$` as a variable reference.
+`interpolate()` replaces `{{name}}` via `/\{\{(\w+)\}\}/g` — flat keys only;
+`{{a.b}}` matches nothing and stays literal in the string. Dotted paths DO work in
+`oneOf` conditions and `evaluator` expressions, which go through
+`evaluateSafeExpression` with `bindPlaceholders: true` — there `{{name}}` binds as a
+value (never text-spliced), and `a.b[0]`, `.length`, `.includes()`,
+`.startsWith()`, `.endsWith()` are legal. A bad `oneOf` condition evaluates to `false`;
+a bad `evaluator` expression becomes `LOUSHO_FLOW_EXECUTION_FAILED`.
+
+`assertWithinDepthLimit` caps nesting at `maxDepth` (default 100) — recursion through
+`sequence`/`parallel`/`oneOf`/`forEach` children, not flow re-entry.
+
+## Design decisions
+
+- **`return`/`end` produce values, not control flow.** Both resolve `value` and hand it to the parent node; an enclosing `sequence` keeps running and the sequence's *last* step wins. To actually stop a flow, `throw`, or put the remainder inside a `oneOf` branch.
+- **Two node vocabularies, one union.** `EditorShapeStep` (`step`, `bestOfAll`, `condition`, `loop`, `uiComponent`, and `oneOf`/`forEach`/`evaluator` with editor fields like `branches`/`inputFlow`/`criteria`) is what visual editors emit; `RuntimeStep` is what the executor's handlers read. They share `EditorStep` deliberately — but only `RuntimeStep` plus `sequence`/`parallel` execute. An editor-shape `oneOf` (`branches`) silently matches no option (no `options` field → `null`); `loop` isn't in `nodeHandlers` at all, so it fails as `LOUSHO_FLOW_INVALID`. Retries are built as explicit `oneOf` ladders, not `loop` nodes.
+- **The agent is data, not an instance.** `context.agent` is a plain `AgentConfig` — `prompt` is the `llmCall` system message, `settings.model` its fallback model. A `createAgent()` result would run itself, so `isCreateAgentResult` (the `send` method check) rejects it with `LOUSHO_CONFIG_INVALID` rather than silently dropping its instructions (LOU-R14); `FlowBuilder.addAgent` rejects it too.
+- **No `eval`, ever.** `safeExpression` tokenizes, parses (recursive descent, `MAX_DEPTH` 64) and walks the AST itself. `constructor`/`__proto__`/`prototype` keys and globals are refused; non-comparison operators require primitives; methods are a three-name allowlist.
+- **Tool calls honor the sandbox seam.** `executeToolWithSandboxGuard` is shared with `AgentExecutor`, so a flow can't bypass `requiresSandbox` routing (the LOU-F fix).
+
+## Example
+
+```ts
+import { FlowBuilder, FlowExecutor, type EditorStep } from '@lousho/build-ai-agent/flows';
+
+const steps: EditorStep = {
+  type: 'sequence',
+  steps: [
+    { type: 'llmCall', prompt: 'Classify: {{message}}', outputVariable: 'category' },
+    {
+      type: 'oneOf',
+      options: [
+        { condition: "'{{category}}' === 'billing'", step: { type: 'return', value: 'billing' } },
+        { step: { type: 'return', value: 'other' } }, // default: no condition
+      ],
+    },
+  ],
+};
+
+const flow = new FlowBuilder().setCode('triage').setName('Triage')
+  .addInput({ name: 'message', type: 'shortText', required: true })
+  .setFlow(steps).build();
+
+const result = await FlowExecutor.execute(flow, {
+  agent: { name: 'triage', prompt: 'You triage support mail.' }, // plain AgentConfig
+  provider,
+  variables: { message: input },
+});
+```
+
+## Where next
+
+- [Flow vs loop](/design/flow-vs-loop) — why retries are `oneOf` ladders.
+- [Streaming events](/core/streaming-events) — the `FlowExecutionEvent` surface.
+- User docs: [Flows](https://lousho.com/flows).

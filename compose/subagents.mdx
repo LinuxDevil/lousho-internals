@@ -1,0 +1,87 @@
+---
+title: Sub-agents
+description: How the `subagents` option wires the `task` tool, background fan-out, remote and Pi sub-agents into a lead run.
+---
+
+The `subagents` option gives a lead agent ONE `task` tool through which it delegates
+self-contained work to named sub-agents, plus a system-prompt block listing them.
+Sub-agents exist for context isolation: a child sees only the prompt the lead wrote,
+never the lead's transcript, and pays for its own model, tools and steps while the
+lead pays only for the task prompt and the final answer.
+
+## Entry points
+
+- `createAgent({ subagents, subagentOptions })` and `AgentExecutor.execute({ subagents })` — the user-facing surface. Records map names to `createAgent()` agents, `remoteAgent()`/`piAgent()` handles, or a `SubagentCatalog` (`list()`/`resolve()`).
+- `withSubagents(agent, toolRegistry, subagents, run)` in `src/subagents/withSubagents.ts` — applied per run; returns the agent unchanged when there are no sub-agents or the depth budget is spent (`subagentBudget()`, default `maxSubagentDepth` 1).
+- `runSubagent()` in `src/execution/delegation.ts` — the shared delegation core every child runs through.
+- `remoteAgent()`, `defineRemoteSubagent()` (`remoteAgent.ts`), `piAgent()` (`piAgent.ts`), `withSubagentOptions()` and `BackgroundTasks` (`backgroundTasks.ts`), `TaskSessions` (`taskSessions.ts`).
+
+## How it works
+
+`createAgent()` calls `registerSubagent()` so each agent carries a `SubagentSpec` (or a
+per-prompt resolver) in a `WeakMap`. At run start `withSubagents()` validates entries
+(`assertSubagents`: every record entry must be a `createAgent()` agent with a
+`description`), lists catalog summaries, then `withPromptTool()` appends the
+"Available sub-agents" block and registers `task` (`createTaskTool`). Inputs are never
+mutated; the registry is cloned.
+
+`task` takes `{ agent, prompt, description, background?, taskId?, mode? }`. The `agent`
+argument is a zod `enum` over the listed names — the model literally cannot name a
+sub-agent that wasn't listed. A synchronous call runs the child through `runSubagent()`
+with `[...history, { role: 'user', content: prompt }]` as its whole input; the result
+is the child's final text (or its `output` object as JSON) plus a footer
+`[sub-agent '<name>': N step(s), finish reason '...', taskId '...']`. Non-`stop`/`length`
+finishes become `toolFailure`s the model can read and retry. Several `task` calls in one
+turn run in parallel — that is the fan-out mechanism; there is no separate parallel API.
+
+`background: true` hands the run to `BackgroundTasks` (per lead run), which queues at
+`maxConcurrent` (default 3) and returns `{ taskId, status, agent }` immediately.
+`agent_status`, `agent_await` and `agent_cancel` observe/steer the queue. At run end,
+`onRunEnd` cancels still-active tasks (or awaits them with `awaitBackgroundOnFinish`)
+and reports them on `result.backgroundTasks`.
+
+Task sessions (`TaskSessions`, LOU-Y6) keep child transcripts by `taskId` so the lead can
+`resume` or `fork` a task later. Records live in the lead's `SessionStore` under
+`subagent-task-<sha256(scope + taskId)>` — hashed so ids never collide across lead
+sessions — behind a `lousho-subagent-task` header message; runs without a session keep
+them in a per-run `Map`.
+
+`remoteAgent()` (LOU-Y7) is a `RemoteSubagent` that POSTs the prompt to `<url>/chat`
+via the shared session client; a resumed task reuses its remote `sessionId`.
+`piAgent()` adapts the Pi coding agent (`@earendil-works/pi-coding-agent`, lazy optional
+peer): each `task` call is one Pi session under the task's `sessionId`, and a
+`tool_call` extension handler gates every Pi tool call against the `permissions` rules.
+
+## Design decisions
+
+- **Context isolation is the feature.** A sub-agent's input is exactly the prompt string; nothing else crosses. That is why delegation is a tool, not shared state.
+- **One `task` tool, not N tools.** Tool count stays flat as sub-agents grow, and the names constrain the `agent` enum for free.
+- **Approval pause is an exception, not a result.** A paused child throws `SubagentApprovalPause` (a `PropagatingToolError`), which unwinds to the executor and pauses the *lead* durably. A paused background task shows `awaiting-approval`; `agent_await` re-throws it as the lead's own pause (`pauseOnFirst`/`resumeAwaited`), and resume re-enters the same `agent_await` call with the suspended task's args.
+- **Remote ≠ local under permissions.** A remote sub-agent runs under its own server's permissions — it is refused in `plan` mode, and its approval pause only propagates when the lead has an `approvalStore` (`pausable`). Pi has no "run the blocked call" API, so an approved decision re-opens the Pi session and lets that exact tool-name+args call through once (`onceAllowed`) while a decision prompt asks the model to re-issue it.
+- **Inheritance is explicit, not ambient.** `childOptions()` in `delegation.ts` lists what flows down: abort signal, exporter/span parent, hooks (tagged `ctx.subagent`), approval store, `toolConcurrency`, sandbox, principal, event listeners, usage roll-up — each only when the child doesn't set its own.
+
+## Example
+
+```ts
+import { createAgent, withSubagentOptions, remoteAgent, piAgent } from '@lousho/build-ai-agent';
+
+const lead = createAgent({
+  provider,
+  instructions: 'You coordinate research and coding.',
+  subagents: withSubagentOptions(
+    {
+      researcher: createAgent({ provider, instructions: 'Research and cite.', description: 'Finds and summarizes sources' }),
+      deployed: remoteAgent({ url: 'https://researcher.example.workers.dev', auth: token }),
+      coder: piAgent({ cwd: projectDir, description: 'Edits code and runs tests', permissions: [ask(['edit', 'write']), allow('*')] }),
+    },
+    { maxConcurrent: 2, awaitBackgroundOnFinish: true }
+  ),
+});
+```
+
+## Where next
+
+- [Approvals](/core/approvals) — `SubagentApprovalPause`, the gate a child pauses through.
+- [Sessions](/state/sessions) — the `SessionStore` task transcripts are keyed into.
+- [Pi provider](/providers/pi) — the model side of `piAgent()`.
+- User docs: [Sub-agents](https://lousho.com/sub-agents).

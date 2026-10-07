@@ -1,0 +1,70 @@
+---
+title: "Tool system"
+description: "The tool contract, ToolRegistry, parallel execution, and per-tool approval policies — how a zod schema becomes a model-facing function and back."
+---
+
+Every tool in a run — user-defined, built-in, MCP-loaded, OpenAPI-generated, or provider-hosted — flows through one contract: a `ToolDescriptor` with an `inputSchema` and an `execute`. This page covers how `defineTool()` produces that contract, how descriptors become model-facing tool definitions, and how the executor schedules a turn's tool calls.
+
+## Entry points
+
+- `src/tools/defineTool.ts` — `defineTool()`, `DefinedTool`, `ToolInput`, `ToolOutput`, `ToolResultOf`, `isDefinedTool()`. Validation lives in `assertValidOptions` (`defineTool.ts:111`).
+- `src/tools/toolContract.ts` — `getToolInputSchema()`, `getToolExecute()`, `toolDescriptorFromSchema()`, `legacyAiTool()`. The one place the runtime reads a tool's schema and `execute` (LOU-D22).
+- `src/tools/toolEntries.ts` — `toolEntries()`, `ToolsOption`, `ToolArrayEntry`. Flattens every accepted `tools` shape to `[name, tool]` pairs.
+- `src/tools/ToolRegistry.ts` — `ToolRegistry`, `globalToolRegistry`.
+- `src/tools/approvalPolicies.ts` — `always()`, `never()`, `once()`, `approvalMarker()`, `ApprovalPolicy`.
+- `src/types/tool.ts` — `ToolDescriptor`, `ToolExecutionContext`, `ApprovalOutcome`, `ApprovalCheckContext`, `ToolMetadata`, `NamedToolDescriptor`.
+- `src/execution/generateStep.ts` — `buildTools()` (descriptor → provider `ToolDefinition`).
+- `src/execution/toolBatch.ts` — `runToolBatch()`, `ToolConcurrency`, `Limiter`.
+- `src/execution/toolArgsValidation.ts`, `toolErrors.ts`, `toolResult.ts` — argument validation, the `{error, toolName, message, kind}` failure shape, transcript message construction.
+
+## How it works
+
+**Definition.** `defineTool({ name, description, input, execute, ... })` validates eagerly: `name` must match `^[a-zA-Z0-9_-]{1,64}$` (the limit LLM providers impose on function names), `description` must be non-empty, `input` must satisfy `isModelSchema()` — zod 3, zod 4, or any Standard Schema exposing `~standard.jsonSchema` (LOU-D29). Failures throw `ConfigurationError` (`LOUSHO_CONFIG_INVALID`) with a fix-it hint, at definition time rather than at first call.
+
+The returned `DefinedTool` is a `ToolDescriptor` plus `name`, `input`, `inputSchema`, and typed `execute`. It also carries a legacy `.tool` field (`{ description, parameters, execute }`, the `ai` v4 shape) — canonical reads go through `inputSchema`/`execute`, with `tool.parameters`/`tool.execute` as independent fallbacks for hand-written descriptors. Async-generator `execute` functions (N13b) pass through unchanged: each `yield` streams a `tool.partial` event and the last yield is the result.
+
+**Registration.** `createAgent({ tools })` and `ToolRegistry.registerMany()` both flatten input via `toolEntries()` — records keyed by name, arrays of named tools, or mixes (`[mcp.tools, weatherTool]`). A record key colliding with another entry throws immediately (the record form would otherwise overwrite silently); two `defineTool()` results under the same name both pass through so `registerDefined()` throws its richer error naming both tools' `displayName`s. Hosted tools are skipped here — `assertHostedToolNames()` owns their collisions (see [hosted tools](/tools/hosted-tools)). MCP-loaded tools carry `server__tool` names so different servers can never collide (see [MCP](/tools/mcp)).
+
+**Model-facing conversion.** `buildTools()` (`generateStep.ts:41`) reads `agent.tools` entries, resolves each name in the registry, and emits `{ type: 'function', function: { name, description, parameters } }` where `parameters` is the raw zod/Standard-Schema object — each provider's `convertTools` turns it into JSON Schema (zod 4 via `z.toJSONSchema`, zod 3 via the `ai` SDK converter; `jsonSchemaOf()` in `toolSearch.ts` is the same conversion used for token estimates and code-mode signatures).
+
+**Execution.** One turn's calls run through `runToolBatch()`: calls start in order, each only after the previous one passed its *gate* (validation + permission + approval check), so the first call needing approval is identified before anything after it starts. A `Limiter` caps in-flight calls at `toolConcurrency` (default `'unbounded'`). Results append to the transcript as a contiguous prefix — `recordPrefix()` records completed calls in call order and serializes `persist()` writes so an older snapshot never lands after a newer one. A `tool` message's content is `JSON.stringify(result)`; `undefined`/unserializable results become `null` (`toolResult.ts`). Failures become `toolErrorResult()` objects — `{ error, toolName, message, kind }`, message capped at 2,000 chars, `isError` on the message — with kinds `execution | validation | not-found | rejected | not-run | mcp | sandbox | denied`; an error can declare its kind via a `toolErrorKind` property.
+
+**Approval.** `needsApproval` is a boolean or `(args, ctx: ApprovalCheckContext) => ApprovalOutcome` where the outcome is `'ask' | 'approve' | 'deny' | { deny: reason } | boolean`. The `once()` policy reads the transcript itself: resuming an approved call marks its `tool` message with `metadata.approval` (`approvalMarker()`), so the memory survives durable resume in another process; `per: 'args'` keys it on a `cyrb53` hash of sorted-keys JSON. A `'deny'` outcome gives the model a `kind: 'denied'` tool error rather than pausing.
+
+## Design decisions
+
+- **One contract, two shapes.** `inputSchema`/`execute` are canonical; `.tool` exists only for `ai`-v4-shaped descriptors written by hand. `toolContract.ts` centralizes the fallback so no caller needs to know which field a tool set.
+- **Validation at definition, not at call.** Failing fast in `defineTool()` means a typo'd schema surfaces in a unit test, not inside a running agent.
+- **Gate-before-start ordering.** `runToolBatch` never starts a call whose predecessors haven't cleared their gates — this makes "the first call that needs approval" deterministic without serializing execution.
+- **Transcript-as-memory for `once()`.** No separate approval state store: approvals are already what sessions and checkpoints persist.
+- **Errors are data.** Every failure path funnels into `ToolErrorResult` so the model can read and recover; runs almost never die from a tool error.
+
+## Example
+
+```ts
+import { defineTool, once, createAgent } from '@lousho/build-ai-agent';
+import { z } from 'zod';
+
+const sendEmail = defineTool({
+  name: 'send_email',
+  description: 'Send an email',
+  input: z.object({ to: z.string().email(), subject: z.string() }),
+  needsApproval: once({ per: 'args' }), // ask once per distinct recipient set
+  async execute({ to, subject }) {
+    return { messageId: `${to}:${subject}` };
+  },
+});
+
+const agent = createAgent({
+  model: 'openai/gpt-4o-mini',
+  tools: [sendEmail],
+  toolConcurrency: 4, // a turn's calls run up to 4 at a time, recorded in order
+});
+```
+
+## Where next
+
+- [Workspace tools](/tools/workspace-tools) — the built-in fs/shell tool set.
+- [MCP](/tools/mcp) — `server__tool` namespacing and remote descriptors.
+- [Tool search](/tools/tool-search) — `deferLoading` and transcript-derived loading.
+- [Approvals](/core/approvals) — the approval gate, stores, and resume path.

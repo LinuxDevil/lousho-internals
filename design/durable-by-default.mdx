@@ -1,0 +1,56 @@
+---
+title: "Durable by default"
+description: "Why sessions, checkpoints and approvals are store-backed from day one — and what that costs the codebase."
+---
+
+## The decision
+
+State that outlives a single call is written to a pluggable store, not kept in memory: session transcripts behind `SessionStore`, run progress behind `CheckpointStore`, paused approvals behind `ApprovalStore`, OAuth tokens behind `OAuthTokenStore` — bundled as one `AgentStore` option on `createAgent({ store })` (`src/storage/agentStore.ts`). A checkpoint is written after every model response that asks for tools, after every recorded tool result, on abort, on pause and on finish (`src/execution/checkpoint.ts`), so a crashed or interrupted run resumes from its last committed step — in the same process or another one, days later.
+
+## Alternatives rejected
+
+- **In-memory runs, persistence as a bolt-on.** A human approval can legitimately take days; an in-memory pause dies with the process and silently turns "waiting for approval" into "lost the run". Retrofitting persistence afterwards would have meant threading `save`/`load` through the executor, the session layer and the approval gate all at once — the seams are exactly the same either way, so they were store-shaped from the start.
+- **An external workflow engine (Temporal-style orchestration).** The SDK's premise is that it runs inside your Node process with no required service. Pushing durability to an orchestrator would make that service mandatory for basic multi-turn work.
+- **One store for everything.** Approvals and checkpoints are deliberately separate interfaces: an approval is a decision waiting to happen, a checkpoint is progress so far, and they have different lifecycles (delete-on-read `resolve()` vs overwrite `save()`). See the "approval record first, checkpoint second" ordering in [approvals](/core/approvals).
+
+## Where it shows up
+
+- `src/execution/checkpoint.ts` — the `Checkpoint` shape (transcript, `stepIndex`, `usage`, `businessState`, `status`, `approvalId`, `agentFingerprint`, `runConfig`, `principal`, `metadata`) and the `CheckpointStore` interface with its optional bounded `history()`.
+- `src/session/sessionStore.ts` — `MemorySessionStore` (the default) and `FileSessionStore` (atomic temp-file + rename).
+- `src/execution/ApprovalGate.ts`, `src/execution/resume.ts` — the pause/resume pair that makes an approval survive restarts; `resumeAfterApproval()` deletes the stale pre-pause checkpoint before re-entering `execute()` so resumption can't rehydrate it (LOU-K5).
+- `src/execution/errors.ts` — `SessionAwaitingApprovalError` carries `sessionId`, `approvalId` and `approvalKind` so a caller that stumbles onto a paused session knows exactly what to resolve.
+- `src/storage/` — `SqliteStore`, `fileStore()`, `memoryStore()`; `src/deploy/kvStore.ts` / `kvCheckpointStore.ts` for the Cloudflare Worker target.
+
+Contributor ripples: every field added to `Checkpoint` or `PendingApproval` is a persistence-migration decision (old records must still load — hence the "absent on older checkpoints" comments); a run paused inside a sub-agent snapshots enough to re-extend the agent on resume; and `store` is a *run-level* option — after a `handoff()` the run keeps the entry agent's stores, and `createAgent` warns once when a target was built with `store`/`approvalStore`/`approve`/`permissionMode`/`approvalTtlMs` (`runLevelOptionNames` in `src/createAgent.ts`, `warnRunLevelOptions` in `src/handoffAgents.ts`, N6).
+
+## Trade-offs accepted
+
+- `Checkpoint` payloads must survive `JSON.stringify`/`JSON.parse` — `businessState` is explicitly unvalidated JSON (checkpoint.ts), so the SDK gives no schema guarantees on it.
+- Store implementations are a consumer contract with subtle semantics (atomicity, `history` rings, `delete` with `keepHistory`), tested through contract tests (`checkpointHistory.contract.test.ts`, `sessionFork.contract.test.ts`).
+- Resume re-executes tool calls that have no recorded result — idempotence of a paused call is the tool's problem, not the store's. Partial (`tool.partial`) output is lost on a crash.
+- Durability is per-`sessionId`: the same-sessionId concurrency assumption is accepted rather than adding locking to stores.
+
+## Example
+
+```ts
+const agent = createAgent({ provider, store: new SqliteStore('./.lousho/jobs.db') });
+
+try {
+  await agent.send('Book a table for 2', { sessionId: 'chat-42' });
+} catch (error) {
+  // Process restarted while paused: the checkpoint says awaiting-approval.
+  if (error instanceof SessionAwaitingApprovalError) {
+    await agent.approvals.resolve({ id: error.approvalId!, approved: true });
+  }
+}
+
+// After a crash mid-run: finishes the interrupted turn, or null.
+await agent.resume('chat-42');
+```
+
+## Where next
+
+- [Durable execution](/core/durable-execution) — checkpoint lifecycle and resume semantics.
+- [Approvals](/core/approvals) — the snapshot + delete-on-read pause protocol.
+- [Sessions](/state/sessions) and [storage stores](/state/storage-stores) — the transcript side and the `AgentStore` bundle.
+- [Build targets](/ship/build-targets) — how the KV stores make this work on Workers.

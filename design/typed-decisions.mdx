@@ -1,0 +1,61 @@
+---
+title: "Typed decisions"
+description: "Why routing/scoring runs through an output schema with a confidence floor — and why the OpenAI Decisions endpoint got its own client instead of a provider."
+---
+
+## The decision
+
+Two surfaces, one pattern. The portable form is `createAgent({ output })`: a model turn constrained to a zod schema returns `result.object` — `{ route, confidence, reason }` — and deterministic code (usually a flow `oneOf`) branches on the typed fields, with a *confidence floor* routing low-confidence calls to a safe path instead of acting on a guess (`docs/prompting-techniques.md`, "Typed decisions"; `examples/coding-agent-workflows`). The fast form is `decide()` (`src/decisions/decide.ts`): a dedicated client for the OpenAI Decisions API (`POST {baseURL}/decisions`) that evaluates typed questions — `predicate`, `choice`, `score` — against shared input and returns calibrated `probabilities`/`confidence`, roughly 10x faster than a full model turn.
+
+## Alternatives rejected
+
+- **Routing `decide()` through `LLMProvider`/providers.** The Decisions endpoint is not part of chat completions: no `messages → text`, no tools, no streaming, and the response is a probability distribution, not prose. Forcing it through `generate()` would mean faking a `Message[]` request and flattening `probabilities` into a text the caller re-parses — losing exactly what the endpoint is for. It also isn't served through OpenRouter, so the provider abstraction couldn't reach it anyway (`docs/decisions.md`). A standalone `decide(options)` keeps the provider surface provider-agnostic and isolates the beta API.
+- **Letting the model's reply drive action without a floor.** A classifier that always answers still guesses; the floor (`confidence < 0.7 → careful path` in the example) converts "decide" into "decide or escalate". The unparseable-reply case degrades to zero confidence rather than a default route — "cannot decide" is itself a decision outcome.
+- **One question per call.** Independent questions share one `input` and one request — batching is the API's shape, and `answers` echo each question's `name` (`validateQuestions` enforces unique names, non-empty `choices`, ≥2 `levels`).
+
+## Where it shows up
+
+- `src/decisions/decide.ts` — the whole client in one file: question types, zod `responseSchema`, `AbortSignal.any` timeout merge, error mapping onto the standard codes (`LOUSHO_PROVIDER_MISSING_API_KEY`, `LOUSHO_PROVIDER_RATE_LIMITED`, `LOUSHO_PROVIDER_REQUEST_FAILED`, `LOUSHO_OPERATION_TIMEOUT`). Exported from the root (`src/decisions/index.ts` via `src/index.ts`).
+- `docs/decisions.md` — user-facing contract, including the beta caveat (`gpt-6-luna` is the only served model; the surface may change).
+- `examples/coding-agent-workflows/index.ts` — the `output`-schema form: `DECISION = { route, confidence, reason }`, `confidenceFloor` default 0.7, low confidence escalates *any* route to the careful workflow.
+- `docs/prompting-techniques.md` — where the pattern sits in the wider catalog (the "System One" step inside a deterministic "System Two" program).
+
+## Trade-offs accepted
+
+- `decide()` is OpenAI-only by construction (`OPENAI_API_KEY`, overridable `baseURL` for a compatible endpoint); portable apps keep the `output`-schema form on any provider.
+- A refusal is a first-class answer (`{ type: 'refusal' }`) — callers must handle it as their "send to review" path; there is no default.
+- The `output` route costs a full model turn and its `confidence` is self-reported prose-calibration; the Decisions endpoint returns a real per-option distribution but no prose and no tools — neither form reasons with tools, so anything needing evidence-gathering still wants a sub-agent or flow (docs/decisions.md, "When to use what").
+- A beta endpoint is a maintenance bet: the response is zod-validated so a shape change becomes `LOUSHO_PROVIDER_REQUEST_FAILED` rather than silent garbage, but the client will need revisiting when the API stabilizes.
+
+## Example
+
+```ts
+import { decide } from '@lousho/build-ai-agent';
+
+const { answers } = await decide({
+  input: 'I was charged twice for my order.',
+  questions: [{
+    type: 'choice', name: 'route', instructions: 'Which team handles this?',
+    choices: [
+      { value: 'billing', description: 'Payments, invoices, refunds.' },
+      { value: 'shipping', description: 'Delivery and tracking.' },
+      { value: 'other' },
+    ],
+  }],
+});
+
+const route = answers[0];
+// act only above the floor; otherwise escalate
+if (route.type === 'choice' && route.confidence >= 0.7) {
+  dispatch(route.choice);
+} else {
+  escalateToHuman();
+}
+```
+
+## Where next
+
+- [Decisions](/providers/decisions) — the endpoint mechanics and answer shapes.
+- [Structured output](/providers/structured-output) — the `output` schema side of the pattern.
+- [Flows](/compose/flows) — the `oneOf` branch points decisions feed.
+- [Sub-agents](/compose/subagents) — when the "decision" needs tools first.

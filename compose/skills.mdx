@@ -1,0 +1,71 @@
+---
+title: Skills
+description: How SKILL.md files become `Skill` objects and how `load_skill` delivers their content to the model on demand.
+---
+
+Skills are progressive disclosure for instructions: only a one-line description sits in
+the system prompt; the full markdown body is delivered when the model calls the
+auto-registered `load_skill` tool. A skill is data — `{ name, description, content }` —
+not a runtime.
+
+## Entry points
+
+- `defineSkill({ name, description, content })` (`src/skills/defineSkill.ts`) — validates and freezes a `Skill`.
+- `loadSkills(dir)` (`src/skills/loadSkills.ts`) — loads a directory of skills.
+- `withSkills(agent, toolRegistry, skills)` (`src/skills/withSkills.ts`) — applied per run by `createAgent({ skills })` / `AgentExecutor.execute({ skills })`.
+- `withPromptTool(agent, toolRegistry, tool, block)` — the shared "register one tool + append one prompt block" helper that skills and sub-agents both use.
+
+## How it works
+
+`defineSkill` enforces `name` against `/^[a-z0-9][a-z0-9-_]{0,63}$/` (file- and
+tool-friendly) and requires non-empty `description` and `content`; failures are
+`LOUSHO_SKILL_INVALID` with a rename suggestion derived from the bad name.
+
+`loadSkills` accepts two layouts that may be mixed in one directory: `dir/<name>/SKILL.md`
+(the Anthropic/open-harness convention — folders without a `SKILL.md` are skipped) and
+`dir/<name>.md`. Each file's YAML frontmatter must carry `description` (a missing or
+non-mapping frontmatter errors with the file name); `name` is optional and defaults to
+the folder or file name. Duplicate skill names across files throw. The result is sorted
+by name, so prompt order is deterministic.
+
+`withSkills` does two things via `withPromptTool`: appends an "Available skills" block
+(`- name: description` per skill, plus the instruction to call `load_skill` first) to
+the run's system prompt, and registers one `load_skill` tool whose `execute` looks the
+name up in a `Map` and returns `skill.content`. The tool is annotated
+`readOnlyHint: true`, so it is callable in `plan` mode. Both the agent config and the
+`ToolRegistry` are cloned — inputs are never mutated.
+
+## Design decisions
+
+- **The prompt lists; the tool delivers.** Paying ~one line per skill per request instead of the whole corpus is the entire point; `content` never enters the prompt implicitly, only as a `load_skill` tool result, so it lands in the transcript at the moment the model decided it needed it.
+- **Errors are self-correcting tool results.** An unknown `name` throws a `toolFailure` listing the valid names — the model sees it and retries, rather than failing the run.
+- **Skills are resolved per run, not per agent.** `withSkills` runs inside the executor's per-run assembly, which is why `AgentExecutor.execute({ skills })` can attach skills to a one-off run and why a `createAgent()` agent's skill set can be swapped without rebuilding it.
+- **Skill names are tool names.** The `load_skill` input is `{ name }` and name validation matches tool-name constraints — anything file-unsafe or uppercase is rejected at `defineSkill` time, not at call time.
+- **A `load_skill` collision is config, not shadowing.** If the agent already has a `load_skill` tool, `withSkills` throws `LOUSHO_SKILL_INVALID` — silently shadowing a user's tool would be worse than failing loudly.
+
+## Example
+
+```ts
+import { createAgent, defineSkill, loadSkills } from '@lousho/build-ai-agent';
+
+const changelog = defineSkill({
+  name: 'changelog',
+  description: 'How to write a changelog entry',
+  content: '# Changelog entries\n\nUse the imperative mood and link the PR.',
+});
+
+const agent = createAgent({
+  provider,
+  prompt: 'You are a release engineer.',
+  skills: [changelog, ...(await loadSkills('./skills'))],
+});
+// Prompt gains "## Available skills\n- changelog: How to write a changelog entry ..."
+// plus a `load_skill({ name })` tool returning the content.
+```
+
+## Where next
+
+- [Agent directories](/compose/agent-directories) — `skills/` folders load through this same `loadSkills`.
+- [Claude projects](/compose/claude-projects) — `.claude/skills/*/SKILL.md` reuse it unchanged.
+- [Permission modes](/core/permission-modes) — why `load_skill` is read-only.
+- User docs: [Skills](https://lousho.com/skills).

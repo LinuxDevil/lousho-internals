@@ -1,0 +1,62 @@
+---
+title: "Hooks"
+description: "The AgentHook extension points inside the execution loop: registration order, live-mutable contexts, the deny/result/input outcomes, where each hook fires relative to the gate, and how sub-agents inherit them."
+---
+
+`AgentHook`s are named, ordered plugins that run at four fixed points — `preToolCall`, `postToolCall`, `preGenerate`, `postGenerate` — receiving *live* references to what the executor is about to use (the args object, the messages array, the `GenerateOptions` request). They are the mutation-capable counterpart to `onLLMRequest`/`onToolCall`-style callbacks, which only observe.
+
+## Entry points
+
+- `AgentHook`, `HookRegistry`, `HookContext`, `ToolCallHookContext`, `ToolCallHookResult`, `GenerateHookContext`, `PreToolCallOutcome`, `PostToolCallOutcome`, `PreToolCallDecision`, `SubagentInfo`, `HookEventPayload` — `src/execution/hooks.ts`.
+- Tool-call integration: `toolHookContext`, `runPreToolHooks`, `runPostToolHooks` (private), `hookStopOutcome`, `hookInputFailure` — `src/execution/toolCallExecution.ts`.
+- Model-call integration: `generateHookContext` (private), `hooks.runPreGenerate`/`runPostGenerate` call sites — `src/execution/generateStep.ts`.
+- Resume re-fire: `resumedHookCall`, `runApprovedToolCall` — `src/execution/resume.ts`.
+- Sub-agent inheritance: `hooksForSubagent`, `decorateHook`, `nestSubagent` — `src/execution/delegation.ts`.
+- Resume-time handoff hooks: `resumeHandoffCall`, `replaceHandoffResultByHook` — `src/execution/resume.ts`.
+
+## How it works
+
+**Registry.** `HookRegistry` is a branded class (`instanceof` survives cross-copy SDK loads, LOU-D42) with a `ToolRegistry`-mirroring API (`register`, `registerMany`, `get`, `has`, `list`, `unregister`, `clear`, `size`). `register` on a duplicate `name` replaces with a `console.warn`. All `runXxx` methods iterate `this.hooks` in registration order, awaiting each — a later hook sees earlier mutations.
+
+**Tool-call hooks** fire inside `prepareToolCall`/`settleToolCall` (`toolCallExecution.ts`):
+
+- `preToolCall(ctx)` runs *after* arg parsing/validation, *before* permission rules → guardrails → `needsApproval` → permission mode. `ctx.args` is the live parsed-args object. Returns: nothing (continue, in-place mutation still applies), `{ deny: reason }` → `kind: 'denied'` tool error + audited hook denial via `reportHookDenial`, `{ result }` → call skipped, result stands (`replacedByHook` recorded), `{ input: args }` → re-validated against the tool schema then used; later hooks see the new `ctx.args`. First `deny`/`result` stops the pre-hook sequence (`PreToolCallDecision.stop`); `input`s chain (`inputBy` names collected).
+- `postToolCall(ctx, result)` runs after the call settles (success, tool error, or approval-required). `{ result }` rewrites what the model sees and sets `replacedByHook` on the outcome/message/`tool.done` event; skipped for `requiresApproval`/`subagent`/`signIn` outcomes.
+- Context fields: `toolCallId`, `toolName`, `args`, `toolCall`, plus `agentId`, `agentName`, `sessionId`, `messages` (live), `metadata`, `principal`, `subagent`, `resumedAfterApproval`.
+
+**Generate hooks** fire in `prepareGenerateRequest`/`generateInSpan` (`generateStep.ts`): `preGenerate(ctx)` sees the built `GenerateOptions` (`ctx.request`, live — pushing a message or changing `temperature` affects the call); `postGenerate(ctx, result)` sees the `GenerateResult`. `ctx.emit(event)` injects `compaction.start`/`compaction.done` events into the run's stream when a sink exists — the only hook-authored events.
+
+**Approved-call re-fire.** `resumeAfterApproval` re-runs `preToolCall`/`postToolCall` for the paused call with `ctx.resumedAfterApproval = true` and `approvedArgs` = the args the human approved; `runPreToolHooks` compares the post-hook args by `stableStringify` and refuses with `kind: 'validation'` if a hook tried to change them — a hook cannot alter what was approved. Stateful hooks (counters, loop guards) skip the re-fire with `if (ctx.resumedAfterApproval) return;`.
+
+**Sub-agents.** `hooksForSubagent` clones the parent's registry, wrapping each method to tag `ctx.subagent` (name/depth/toolCallId/parent chain via `nestSubagent`) and `markPropagating` any thrown error so it halts the *whole* run, not just the child. Handoff calls pass through the same pre/post hooks via `resumeHandoffCall`/`settleHonoredHandoff` — a post-hook can even rewrite the routing result the target reads.
+
+## Design decisions
+
+- **Live references, not snapshots.** The file-level comment is explicit: hooks get the actual `args`/`messages`/`request` so `redact-pii` mutating `ctx.args` or `inject-context` pushing a message *actually changes the run*. Snapshots would make hooks observers.
+- **Throws propagate.** A throwing hook rejects the run (out of `runXxx` → `execute()`), deliberately *not* converted to a conversational tool error: hooks are trusted control-plane code (a rate-limiter that means to halt), and silently swallowing would defeat them. Contrast with a *tool's* own throw → `toolErrorResult` the model sees.
+- **Outcomes as data, not exceptions.** `{ deny }`/`{ result }`/`{ input }` let hooks settle a call without raising — the executor converts them to the same `toolErrorResult`/`replacedByHook` machinery as rule denials, keeping audit and events uniform.
+- **`approvedArgs` pinning.** Resume re-running hooks re-opens the mutation surface; pinning to the approved args closes the "approve X, run Y" hole (LOU-X3.2).
+- **Registry mirrors `ToolRegistry`.** Deliberately parallel API so hook management feels identical to tool management.
+
+## Example
+
+```ts
+const guard: AgentHook = {
+  name: 'guard',
+  preToolCall(ctx) {
+    if (ctx.toolName === 'shell') return { deny: 'Use workspace tools instead' };
+    if (ctx.toolName === 'search') return { input: { ...ctx.args, limit: 10 } };
+  },
+  postToolCall(_ctx, result) {
+    return typeof result.result === 'string' ? { result: result.result.slice(0, 2000) } : undefined;
+  },
+};
+const agent = createAgent({ provider, instructions, tools, hooks: [guard] });
+```
+
+## Where next
+
+- [Execution loop](/core/execution-loop) — where hooks sit relative to the gate.
+- [Permission modes](/core/permission-modes) — modes apply after hooks; hooks can't be mode-overridden.
+- [Approvals](/core/approvals) — `resumedAfterApproval` and `approvedArgs` on resume.
+- [Streaming events](/core/streaming-events) — `replacedByHook` and `ctx.emit` surfaces.

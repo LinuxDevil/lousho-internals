@@ -1,0 +1,65 @@
+---
+title: "Run lifecycle"
+description: "The states a single execute() call moves through — from option validation to one of eight terminal finishReasons — and the bookkeeping that wraps it: spans, budgets, onRunEnd, aborts and queued input."
+---
+
+A run is the lifetime of one `AgentExecutor.execute()` (or `resumeAfterApproval()`) call: it opens an `invoke_agent` span, iterates steps, and ends in exactly one `finishReason`. Sessions sit above this — an `AgentSession` runs each user message as its own run with a shared transcript — so everything on this page describes a *single-turn* run.
+
+## Entry points
+
+- `AgentExecutor.execute` → `runWithEnd` → `runAgentLoop` → `runSteps` — `src/execution/AgentExecutor.ts`.
+- Terminal paths: `finishRun`, `abortRun`, `stopForBudget`, `stopForGuardrail`, `savePause`, `outOfSteps` — same file.
+- `startBudget`, `maxStepsOf`, `budgetOfAbort`, `BudgetExceededError` — `src/execution/budget.ts`.
+- `ExecutionFinishReason`, `ExecutionResult` — `src/execution/AgentExecutor.ts`.
+- `InputQueue` (`push`, `steer`, `startCall`, `callOutput`, `startBatch`, `endPhase`, `take`, `close`) — `src/execution/inputQueue.ts`.
+- `AgentSession` turn plumbing — `src/session/AgentSession.ts`; approval-bound continuation in `src/createAgentApprovals.ts`.
+
+## How it works
+
+**Open.** `execute()` → `observeRun` (attaches the event sink) → `withSpan(invoke_agent)` → `runWithEnd`: `startBudget(options.limits, options.sessionBudget, options.signal)` composes the run and session limit scopes and, when `maxDurationMs` is set, an `AbortController` whose timer aborts with a `BudgetExceededError` reason; `extendRunOptions` composes the agent surface. `onRunEnd` is guaranteed exactly once in the `finally` — `{ result }` on resolve (any finishReason, including `'aborted'`/`'awaiting-approval'`/`'max-steps'`) or `{ error }` on reject.
+
+**Run.** `runAgentLoop` loads state (fresh or rehydrated), freezes `options.principal`/`options.metadata` from what was loaded, checks drift, and checks input guardrails before anything else. `stopBeforeStep` re-checks `signal` and `budget.check(usage, steps)` before every model call — the loop only ever *leaves* through a step boundary or an early-exit `ExecutionResult`.
+
+**Close — one of eight terminal reasons** (`ExecutionFinishReason`):
+
+| `finishReason` | Produced by | Checkpoint status |
+| --- | --- | --- |
+| model's own (`'stop'`, `'length'`, `'tool_calls'`, `'content_filter'`, `'error'`) | `finishRun` after a text-only reply | `'finished'` |
+| `'awaiting-approval'` | `pauseForApproval` → `savePause` | `'awaiting-approval'` + `approvalId` |
+| `'aborted'` | `abortRun` (`signal` fired; a provider `AbortError` counts as the abort, never a failure) | `'in-progress'` (resumable) |
+| `'max-steps'` | `outOfSteps` — the budget ran out mid-continuation | `'finished'` |
+| `'output-invalid'` | `checkOutput` — `output` schema failed after one repair step | `'finished'` |
+| `'budget-exceeded'` | `stopForBudget` — `limits`/`sessionBudget` tripped (or throws `BudgetExceededError` under `onExceeded: 'throw'`) | `'finished'` |
+| `'guardrail'` | `stopForGuardrail` (or throws `GuardrailError` under `onTripped: 'throw'`) | `'finished'` |
+| thrown error | any rejection: hook, provider, `PropagatingToolError` → `runFailed` → `error` + `run.done('error')` events | last `'in-progress'` state kept |
+
+`'aborted'` is a *resolve*, not a rejection — deliberate, so callers get the partial transcript. `maxSteps` defaults to 10 (`maxStepsOf`); `limits.maxSteps` replaces it as the cap when set alone.
+
+**Mid-run input.** `InputQueue` feeds `run.enqueue()`/`run.steer()`/`send(input, …)` mid-turn: queued messages join the transcript at the next safe point (after the current tool results, before the next model call) via `applyQueuedInput`. `steer()` aborts the in-flight model call through `startCall`'s controller *only until it first emits* (`callOutput` flips on the first `text.delta`/`tool-call`); after that it degrades to a queue. Unapplied input rides at the tail of every checkpoint so a crash loses nothing.
+
+## Design decisions
+
+- **Abort resolves.** Cancellation is a user action, not a failure — `result.finishReason === 'aborted'` plus the transcript so far is more useful than an exception, and a checkpointed abort is resumable (LOU-V1).
+- **Budget checks sit at step boundaries** (before each model call, and after one that asked for tools) except `maxDurationMs`, which needs a timer to interrupt in-flight work; the abort reason is a `BudgetExceededError` so `abortRun` can route it to `stopForBudget` instead of a plain `'aborted'`.
+- **`onRunEnd` in `finally`.** One settle hook for every outcome — including results that resolve with pause/abort reasons — avoids the classic "success path only" cleanup bug (LOU-Y4.2).
+- **`run.start`/`run.done` exactly once.** The sink drops a second top-level `run.start` (a streamed resume emits its own) and closes on `run.done` — event consumers can treat the pair as brackets.
+- **A failed run keeps its last `'in-progress'` checkpoint.** Rejection is not an end state for durability: `execute()` again with the same `sessionId` resumes the unfinished run.
+
+## Example
+
+```ts
+const controller = new AbortController();
+const run = AgentExecutor.stream({ agent, input: 'Draft the report', provider, signal: controller.signal });
+
+for await (const event of run) {
+  if (event.type === 'text.delta') process.stdout.write(event.text);
+}
+const result = await run.result; // 'stop' | 'aborted' | 'awaiting-approval' | ...
+```
+
+## Where next
+
+- [Execution loop](/core/execution-loop) — what happens inside one step.
+- [Approvals](/core/approvals) — the `'awaiting-approval'` end state and resume.
+- [Durable execution](/core/durable-execution) — how terminal states map to checkpoint statuses.
+- [Streaming events](/core/streaming-events) — the `run.start`→`run.done` envelope.

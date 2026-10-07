@@ -1,0 +1,43 @@
+---
+title: "Adding a feature"
+description: "The end-to-end checklist for shipping a new capability: code, tests, docs, exports, gates."
+---
+
+A feature is done when all five surfaces are consistent — code, tests, docs, public API report, generated files. PRs that forget the generated files fail CI after a green first pass; run the [dev workflow](/dev-workflow) gate list before pushing.
+
+## The checklist
+
+<Steps>
+  <Step title="Put the code where it belongs">
+    New subsystem → `src/<name>/` with an `index.ts` barrel and colocated `*.test.ts`. Extending a subsystem → inside its directory. Keep `node:` imports out of anything reachable from the `worker` export — the Cloudflare bundle refuses them.
+  </Step>
+  <Step title="Export deliberately">
+    Root barrel (`src/index.ts`) for core user-facing APIs; an existing subpath (`/tools`, `/flows`, `executor`, …) for narrower surfaces. Adding an export changes the API report — run `npm run api:update` and eyeball the diff.
+  </Step>
+  <Step title="Test offline first">
+    `mockModel()` scripts model turns; `fakeFetch`-style injection covers REST clients; real-MCP/stdio tests exist as precedent. `*.live.test.ts` runs only when the key is set — keep it out of the default path.
+  </Step>
+  <Step title="Document at the source">
+    `docs/<feature>.md` is the source of truth (synced to the docs site). Every ` ```ts ` block must typecheck against `src/` — the verifier runs in CI. Fragments that can't run alone use `no-run` (still typechecked) or `no-verify` (skipped entirely — use sparingly).
+  </Step>
+  <Step title="Regenerate the artifacts">
+    `npm run docs:llms` (README/docs/example-READMEs feed llms.txt + llms-full.txt), `npm run api:update`, `npm run fallow` (new code hits the complexity gates), CHANGELOG `## [Unreleased]` entry, and the docs-repo sync + nav entry if it's a docs page.
+  </Step>
+</Steps>
+
+## Wiring points by feature type
+
+| If you're adding… | Start at |
+|---|---|
+| A tool built-in | `src/tools/built-in/` + `ToolRegistry` registration |
+| A provider | `src/providers/` — implement the shared contract, extend `resolveProvider`/`providerSpec` |
+| A flow node type | `src/flows/FlowExecutor.ts` executor semantics + `validators.ts` |
+| A store | the `AgentStore` contract in `src/storage/` |
+| A channel/trigger | `src/channels/defineChannel.ts` / `src/triggers/` adapter shape |
+| A build target | `src/deploy/` — check worker constraints |
+| A CLI command | `src/cli/` dispatch table |
+| A kit | `registry/` + permission manifest, verified by `registryEnforce` |
+
+## Review bar
+
+New behavior needs a test that would fail without it; new public API needs an api-report diff you can explain; new docs need verified snippets. CI runs the full gate list plus the `ai`/`zod` peer matrix — if your change touches provider plumbing, run `npm run test:live` once with a key.

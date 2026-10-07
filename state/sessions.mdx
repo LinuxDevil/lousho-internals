@@ -1,0 +1,64 @@
+---
+title: "Sessions"
+description: "Inside AgentSession: how agent.session() owns a transcript across turns, how turns are serialized and checkpointed, pending-turn resume, forking, and session id rules."
+---
+
+`agent.send()` is single-turn — every call starts from an empty history. `AgentSession` is the multi-turn wrapper: it owns the transcript (the conversation *without* the system prompt), appends each `send()`/`stream()` input, passes the whole history to one `AgentExecutor.execute()` per turn, and persists the result. With a `CheckpointStore` attached, each turn is also a durable run that a crash can resume.
+
+## Entry points
+
+- `AgentSession`, `SessionOptions`, `SessionStores`, `PendingTurn` — `src/session/AgentSession.ts`.
+- `SessionRunner`, `SessionStreamRunner`, `SessionSpawner` — the closures `createAgent()` injects (`src/createAgent.ts`, `session()` factory ~line 1229).
+- `SessionStore`, `MemorySessionStore`, `FileSessionStore`, `encodeBytes`/`decodeBytes` — `src/session/sessionStore.ts`.
+- `assertSessionId` — `src/session/sessionId.ts` (Worker-safe: no Node builtins).
+- `streamSessionTurn`, `SessionTurn` — the `session.stream()` wrapper, `src/session/sessionStream.ts`.
+- `transcriptSteps`, `forkTranscript`, `SessionHistoryStep`, `SessionForkOptions` — `src/session/sessionFork.ts`.
+- `providerValidPrefix`, `withDefaultStores` — transcript trimming and store-option merging, `AgentSession.ts`.
+
+## How it works
+
+**Session vs run vs step.** A *session* is the conversation across turns (its `id` + transcript). One `send()`/`stream()` is one *turn* — exactly one `AgentExecutor.execute()` call, i.e. one run. A *step* is one model call inside that run (`checkpoint.stepIndex`). `session.history()` numbers steps 1-based across the whole session, each assistant message plus its tool results.
+
+**One turn.** `send()` → `nextTurn()` → `turn()`: `beforeTurn` resumes any pending checkpointed turn, then the injected `SessionRunner` gets `[...transcript, ...toMessages(input)]`. The runner's `ExecutionResult.messages` goes through `commit()`: the leading `system` message is stripped, `providerValidPrefix()` truncates to the longest prefix where every assistant tool call has its result, the session's cumulative spend is stamped on the last message's `metadata.sessionUsage` when `limits` is set, and `store.save(id, messages)` writes it.
+
+**Serialization.** Every public method goes through `enqueue()`, a promise tail — concurrent `send()`s run in call order and never interleave. `idle()` gates `compact()`/`clear()`/`fork()`, rejecting `LOUSHO_SESSION_BUSY` while a turn is in flight. `turnPolicy` changes what a call does while a turn runs: `'wait'` (default) queues as the next turn; `'queue'`/`'steer'` push the input into the running turn's `InputQueue` and resolve with *that* turn's result.
+
+**Durable turns (LOU-W9).** With `checkpointStore` (from `store.checkpoints`, a `SessionStores` object, or `checkpointStore`), `turnCheckpoint()` derives the run's checkpoint key as `<sessionId>.turn-<transcriptLength>` — computed from committed state, so a fresh process finds it again. `pending()` loads it and maps status to `{ 'in-progress' | 'awaiting-approval', approvalId?, approvalKind? }`; `resume()` re-invokes the runner with `input: []`, which makes `loadRunState` rehydrate instead of appending; `discardPending()` deletes it. A checkpoint found in `'finished'` status (crash between finish and commit) is adopted straight into the transcript.
+
+**Forking (N3a).** `fork({ fromStep, id?, patch? })` calls `forkTranscript()`: keep messages through step `fromStep`'s last tool message, apply `patch.toolResult` in place (`withToolResult`), trim via `providerValidPrefix`, save under `id` (default `<id>-fork-<n>`, first untaken) in the same store, then `spawn()` a new `AgentSession` with identical options and the *current* permission mode. The pending turn, approvals, and workspace side effects stay with the original.
+
+**Streaming.** `stream()` returns a `SessionRun` immediately — a façade `AgentRun` whose events are the inner run's re-stamped under its own `runId`, with `run.done` withheld until the transcript is saved, and early loop exit aborting the turn.
+
+## Design decisions
+
+- **Transcript excludes the system prompt.** `commit()` strips `messages[0]` when it is `system`; the agent re-supplies instructions every turn, so editing instructions or memory blocks affects old sessions (see [context assembly](/state/context-assembly)).
+- **Runners are injected, not imported.** `AgentSession` never touches `AgentExecutor` directly — `createAgent()` supplies `run`/`streamRun`/`spawn`, keeping the session layer a thin, testable state machine over three closures.
+- **Checkpoint key = transcript length.** `<id>.turn-<n>` needs no extra bookkeeping and cannot collide with a fork's key, because a fork's transcript length is part of its own `isTaken` check.
+- **`providerValidPrefix` on commit.** Providers reject orphaned tool calls; truncating the tail means a mid-batch pause or abort never writes a transcript a provider would refuse.
+- **Id rules.** `assertSessionId` enforces `/^[A-Za-z0-9_-]{1,128}$/` — ids become file names in `FileSessionStore`, so `../`, `/` and `.` are refused at the boundary, not at the filesystem.
+
+## Example
+
+```ts
+import { createAgent } from '@lousho/build-ai-agent';
+import { SqliteStore } from '@lousho/build-ai-agent/sqlite';
+
+const agent = createAgent({ model: 'openai/gpt-4o-mini', instructions: 'Be brief.' });
+const store = new SqliteStore('./.lousho/agent.db'); // sessions + checkpoints in one file
+
+const session = agent.session({ id: 'user-42', store, turnPolicy: 'queue' });
+await session.send('My name is Ali.'); // crash here leaves a '.turn-0' checkpoint
+
+const pending = await session.pending();      // { status: 'in-progress' } or null
+const finished = await session.resume();      // finishes the turn without re-running it
+const { text } = await session.send('What is my name?');
+
+const fork = await session.fork({ fromStep: 2 }); // id 'user-42-fork-1', same store
+```
+
+## Where next
+
+- [Storage stores](/state/storage-stores) — `SessionStore` implementations and the `AgentStore` contract.
+- [Context assembly](/state/context-assembly) — what gets prepended to the transcript each turn.
+- [Compaction](/state/compaction) — `session.compact()` and the automatic hook.
+- [Durable execution](/core/durable-execution) — the checkpoint the session's turn writes.

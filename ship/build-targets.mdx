@@ -1,0 +1,61 @@
+---
+title: "Build targets: node-server, docker, cloudflare-worker"
+description: "The DeploymentAdapter lifecycle, how one agent spec or agent directory compiles to three artifacts, and the Worker constraint machinery (shims, leak check, KV store)."
+---
+
+`lousho build --target=<name>` looks up a `DeploymentAdapter` (`src/deploy/types.ts`) and drives it through a fixed lifecycle — `scaffold(agentPath, outDir)` writes the target's source files, `build(outDir)` compiles them with tsup, `describe(outDir)` returns the run/deploy command printed to stdout. The same `AgentSpec` file or agent directory feeds all three targets; what differs is the emitted entrypoint, the platform, and what the runtime may reach.
+
+## Entry points
+
+- `src/deploy/types.ts` — `DeploymentAdapter` interface plus `registerAdapter`/`getAdapter`/`listAdapters`. `registerBuiltInAdapters()` (`src/deploy/index.ts`) registers `node-server`, `cloudflare-worker`, `docker` — an explicit call, not a module side effect, so bundlers can't tree-shake it away.
+- `src/deploy/adapters/node-server.ts` — `NodeServerAdapter`; also exports `loadAgentSpecForDeploy()`, `agentConfigModuleSource()`, `deployDependencies()` reused by the other targets.
+- `src/deploy/adapters/docker.ts` — `DockerAdapter`, a thin wrapper over `NodeServerAdapter` plus a `Dockerfile`.
+- `src/deploy/adapters/cloudflare.ts` — `CloudflareWorkerAdapter`; agent-directory path in `cloudflare-dir.ts`.
+- `src/deploy/bundle.ts` — shared bundling machinery: `sdkRuntimePlugin`, `loadTsup`, `bundleExternals`, the Worker shim plugins.
+- `src/deploy/runtime.ts` vs `src/deploy/runtime.worker.ts` — the Node and Worker runtimes the generated entrypoints bundle.
+- `src/deploy/nodeServer.ts` — `createDeployedAgent`, `createDeployedServer`, `storeFromEnv`: the generated Node server's runtime half.
+- `src/deploy/node-server-dir.ts` / `cloudflare-dir.ts` / `workerAgentDir.ts` / `evalModule.ts` — agent-directory handling on each side.
+- `src/deploy/kvStore.ts` / `kvCheckpointStore.ts` / `kvTokenStore.ts` / `kv.ts` — the `KVStore`/`KVBinding` pieces behind `workerStore`.
+- `src/deploy/specExecution.ts` — `prepareSpecExecution`: the platform-free spec→execute-options mapping both runtimes share via injected `SpecResolvers`.
+
+## How it works
+
+**The virtual runtime specifier.** Scaffolded `server.ts`/`worker.ts` import `@lousho/build-ai-agent/deploy-runtime` (or `-worker`). At build time `sdkRuntimePlugin()` resolves that to `src/deploy/runtime.ts`/`runtime.worker.ts` inside the SDK copy running `lousho build` (`findSdkRoot()` walks up to the `@lousho/build-ai-agent` package.json) — so the artifact is always bundled against the exact SDK version that generated it, and builds work from any `outDir`, even a temp dir with no `node_modules`. `bundleExternals()` inlines everything except the SDK's *optional* peers (from `peerDependenciesMeta`, minus `@opentelemetry/api`), which stay lazy `import()`s that raise the SDK's coded missing-peer error only where needed. `loadTsup()` is lazy for the same reason.
+
+**node-server.** `scaffold()` validates the spec up front (`loadSpec`, `resolveSpecTool` per tool, `specSchedules` for triggers) and writes `agent.config.js` (the validated spec as an ESM default export), a generated `server.ts` (flag/env parsing, `createDeployedServer`, 127.0.0.1 default with a no-token warning off loopback, SIGINT/SIGTERM → `agent.close()`), and `package.json` whose `deployDependencies()` pins `@lousho/build-ai-agent` to `^<building version>` plus the spec's provider peer at the range matching the build's `ai` major (`bundledAiMajor` reads the `ai` version the building SDK resolves) and `@modelcontextprotocol/sdk` when `mcpServers` exist. `build()` runs tsup: single CJS `dist/server.js`, `platform: 'node'`, `target: 'node18'`, `clean`.
+
+For an **agent directory**, `writeAgentDirPointer` records the source in `agent-dir.json` (scaffold and build are separate calls, so the pointer is how `build()` finds it), and `build()` compiles every code file — root `agent`/`auth`/`hooks`/`approve.*` (`ROOT_CODE_FILE`), plus `tools/`/`schedules/`/`channels/`/`memory/` (`CODE_FOLDERS`), each `subagents/<name>/` recursively, skipping `*.d.*ts`/`*.test.*`/`*.spec.*` — into `dist/agent/` as one ESM build with shared chunks (so tools, channels and the server share one SDK copy) and a `createRequire` banner for bundled-CJS deps; `copyAgentDirAssets` copies the rest (instructions, skills, JSON/YAML configs). The server then runs `resolveAgentDir('dist/agent')` on plain JS — no tsx, no node_modules, no sources needed at runtime. The runtime (`nodeServer.ts`) adds `LOUSHO_API_TOKEN` bearer auth (or a token baked via `DeployOptions.auth`; an agent dir's `auth.ts` takes precedence, env token appended), `LOUSHO_STORE=memory|sqlite:<path>` stores, and the same `/chat` routes as `lousho dev`.
+
+**docker.** `scaffold()` delegates to `NodeServerAdapter.scaffold()` and additionally writes a `Dockerfile` (`node:22-slim` — 22 has the `node:sqlite` `LOUSHO_STORE=sqlite:` needs; `npm install --omit=dev`; `ENV HOST=0.0.0.0` because loopback inside a container is unreachable through `-p`; `EXPOSE 3000`; `CMD ["node","dist/server.js"]`) and `.dockerignore`. `build()` reuses the node-server bundle. `describe()`: `docker build -t lousho-agent . && docker run -p 3000:3000 lousho-agent`.
+
+**cloudflare-worker.** `scaffold()` rejects what Workers can't run before writing anything: `assertProviderSupported` (`WORKER_SUPPORTED_PROVIDERS` = `mock`, `openai`, `anthropic`, `openrouter` — no `ollama`, no `pi`) and `assertToolsSupported` (`WORKER_SUPPORTED_TOOLS` = `current-date`, `day-name`, `http`). It writes `agent.config.js`, a `worker.ts` whose `fetch`/`scheduled` delegate to `handleWorkerRequest`/`handleWorkerScheduled`, and `wrangler.toml` (`name` via `workerName`'s DNS-safe slug, `main = "dist/worker.js"`, pinned `compatibility_date` so a given SDK version emits one reproducible config, `no_bundle`, `[triggers] crons` from `workerCrons` — UTC only, five fields, day names not numbers — plus commented `AGENT_CHECKPOINTS` KV and `LOUSHO_HTTP_ALLOW`/`LOUSHO_API_TOKEN` guidance). `build()` bundles ESM `platform: 'browser'` with `noExternal: [/.*/]` and a plugin stack:
+
+- `workerSandboxShimPlugin` — `security/sandboxCore` → `shims/sandboxCore.worker.ts` (the real NoopSandbox needs `node:child_process`), `quickjs-emscripten` → `shims/quickjs.worker.ts` (code mode can't run in a Worker).
+- `workerNodeShimPlugin` — `node:*` and MCP-stdio imports of the five `NODE_SHIMMED_IMPORTERS` modules (`createAgent`, `session/sessionStore`, `session/AgentSession`, `projectInstructions`, `tools/mcp/connect`) → `shims/node.worker.ts`; a builtin imported *anywhere else* is left to fail the leak check.
+- `sdkRuntimePlugin({ sdkEntry: 'worker' })` — bare `@lousho/build-ai-agent` imports in agent code resolve to `workerSdk.ts`, the Node-free export subset (`defineTool`, `defineSchedule`, `defineChannel`, `defineMemory`/`kvMemory`, providers, `SDKError`, …); anything else fails the build with a list of allowed names.
+- `workerUnsupportedPeerPlugin` — `ollama-ai-provider*` and `@earendil-works/pi-ai` stay external lazy specifiers (unreachable: the adapter rejects those providers at scaffold).
+- `workerBuiltinImportersPlugin` — records specifier → importer files for builtins nothing else resolved.
+
+Afterwards `findNodeBuiltinReferences()` scans `dist/worker.js` — any remaining `node:` specifier or bare builtin import (outside the `WORKER_SAFE_BUILTIN_PROBE` `getBuiltinModule`/`loadBuiltinModule` calls `ai`/`@ai-sdk/provider-utils` make for `module`/`dns`/`diagnostics_channel`/`async_hooks`) fails the build naming the importing file (`displayPath`); `measureBundleSize()` warns — doesn't fail — past `WORKER_SIZE_LIMIT_BYTES` (64 MiB *raw*, the post-2026 limit; gzip is informational) and `describe()` reports the measured size and verdict. The Worker runtime (`runtime.worker.ts`) registers the four providers directly (`LLMProviderRegistry.register` — no lazy side effects in a bundle), reads keys from `<TYPE>_API_KEY` bindings (`providerEnvKey`), keeps sessions/checkpoints/approvals in the `AGENT_CHECKPOINTS` KV namespace (`workerStore()` → `KVStore`, fail-open to isolate memory), serves `serveFetch` with `LOUSHO_API_TOKEN` auth, gives `http` a *different* tool (`workerHttp`: `LOUSHO_HTTP_ALLOW` host allowlist — Workers have no DNS pin for the Node tool's SSRF checks), binds `kvMemory()` providers per request, and serves agent directories via `handleWorkerAgentDirRequest` (channels mounted under `/channels`, `ctx.waitUntil` for overruns). Agent directories become `agent.module.ts` — static imports plus embedded JSON — because Workers have no fs or dynamic `import()`; `evalModule()` esbuild-bundles a schedule/config file at scaffold time and imports it via `data:` URL to read cron expressions and config.
+
+## Design decisions
+
+- **Scaffold → build → describe, not one step.** Scaffold writes inspectable source-of-truth files (`server.ts`, `wrangler.toml`, `Dockerfile`); build is pure compilation; describe tells the user the next command. A test `stub` adapter asserts the order.
+- **The spec is the deploy source.** Resolution is shared with `lousho dev`: `specToAgent` on Node (`createDeployedAgent` calls it verbatim), `workerResolvers`/`workerAgent` on Workers mirroring it with platform-safe substitutes — so what dev served is what ships.
+- **Pin to the building SDK, not a range** — the virtual runtime specifier makes a build reproducible even from an unpublished checkout.
+- **Fail at build time, not first request** — tool/provider/cron/KV problems are scaffold errors; Node-builtin leaks fail `build()` with the importing file named.
+- **The manifest of limits is honest** — the Worker `http` tool is fail-closed (`LOUSHO_HTTP_ALLOW` or nothing) precisely because the Node tool's pinned-`lookup` SSRF defense has no Worker equivalent.
+- **Docker reuses node-server wholesale** — only the Dockerfile differs (`HOST=0.0.0.0`, `npm install --omit=dev` for the external peers).
+- **Worker state is opt-in and fail-open** — without the `AGENT_CHECKPOINTS` binding the Worker still runs on per-isolate memory (`isKVBinding` checks the binding structurally; a misconfigured binding counts as absent rather than failing every request), and OAuth tokens are encrypted with the `LOUSHO_TOKEN_KEY` secret. `kvMemory()` providers are symbol-marked for late binding because `env` only exists per request — outside the Worker runtime they throw `LOUSHO_MEMORY_INVALID` pointing at the right store.
+- **Build errors are translated, not raw** — `explainWorkerBuildError` turns esbuild/tsup failures into messages naming the unsupported import, and `workerBuiltinImportersPlugin` feeds the leak check the importing file so the error says *who* pulled `node:fs` in.
+
+## Example
+
+`examples/hostinger-deploy/deploy.mjs` is the end-to-end VM ship: verify the VM via the Hostinger API (`GET /api/vps/v1/virtual-machines`, match by id/hostname/IPv4, require `state === 'running'`) → `lousho build agent/ --target=docker --out=<tmpdir>/docker` → `tar` the context → `scp` to `root@<ip>:/opt/lousho-agent` → remote `docker build` + `docker run -d --restart unless-stopped -p 3000:3000 -e OPENROUTER_API_KEY -e LOUSHO_API_TOKEN -e LOUSHO_STORE=sqlite:/data/lousho.db -v lousho-data:/data` → poll `/health`, then one bearer-authed `POST /chat` round-trip. The agent dir (`agent.json` + `tools/host.ts`) declares `store` and `permissions`, and the sqlite volume makes sessions and paused approvals survive container restarts. Destructive ops (`--recreate`) are deliberately absent — provisioning belongs to the Hostinger API/console.
+
+## Where next
+
+- [The lousho CLI](/ship/cli) — how `runBuild` dispatches to the adapter registry.
+- [Spec files](/ship/spec-files) — the `AgentSpec` these adapters compile.
+- [Agent directories](/compose/agent-directories) — the richer deploy source (tools, schedules, channels, sub-agents).
+- [Server and routes](/interfaces/server-and-routes) — `serveFetch`/`handleChatRequest`, shared by `dev`, `nodeServer`, and the Worker.

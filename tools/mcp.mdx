@@ -1,0 +1,69 @@
+---
+title: "MCP"
+description: "MCP client transports, tool loading and namespacing, annotation-driven approvals, OAuth sign-in for HTTP servers, and the serveMcp server side."
+---
+
+The SDK is both an MCP client (load remote tools into an agent) and an MCP server (expose an agent and its tools to MCP clients). `@modelcontextprotocol/sdk` is an optional peer loaded lazily on first use — a project that never touches MCP never installs it (LOU-D19, LOU-D40).
+
+## Entry points
+
+Client side:
+
+- `src/tools/mcp/connect.ts` — `connectMcp()`, `McpConnections`, `McpServerStatus` (`idle | connected | failed | needs-auth`), internal `ServerConnection`/`openTransport()`.
+- `src/tools/mcp/McpToolLoader.ts` — `loadMcpTools()`, `listRemoteTools()`, `McpClientLike`, `RawMcpTool`, `McpApproval`, `SkippedMcpTool`.
+- `src/tools/mcp/schema.ts` — `jsonSchemaToZod()` (shared with OpenAPI tools).
+- `src/tools/mcp/result.ts` — `handleCallToolResult()`, `McpToolError`, `McpToolResult`, `McpStructuredToolResult`, `McpContentPart`.
+- `src/tools/mcp/agentMcp.ts` — `agentMcp()` (`createAgent({ mcpServers })` wiring), `streamAfter()`/`streamPrepared()`.
+- `src/tools/mcp/mcpOAuth.ts` — `storeOAuthProvider()`, `startMcpSignIn()`, `completeMcpSignIn()`, `assertMcpOAuth()`, `mcpFetch()`, `isMcpAuthError()`.
+- `src/spec/schema.ts` — `McpServerSpec` = `McpStdioServerSpec` (`command/args/env`) | `McpHttpServerSpec` (`url/headers/oauth`), each with `approval` and `deferLoading`.
+
+Server side:
+
+- `src/tools/mcp/server/serveMcp.ts` — `serveMcp()`, `ServeMcpOptions`, `ServeMcpHandle`.
+- `src/tools/mcp/server/buildServer.ts` — `buildServer()` (agent tool + direct tools), `server/toolNames.ts` — `sanitizeToolName()`, `needsApprovalGate()`, `toolAnnotations()`; `server/httpTransport.ts` — `listenHttp()`, `McpHttpTransportOptions`.
+
+## How it works
+
+**Connecting.** `connectMcp(servers, { lazy, onError, logger, tokens })` creates one `ServerConnection` per spec. Transport selection: a `url` entry gets `StreamableHTTPClientTransport` (with OAuth, the SDK's `authProvider` plus `mcpFetch()` — a `fetch` wrapper that attaches the configured `headers` only to requests against the server's own origin, never to an authorization server elsewhere); a `command` entry gets `StdioClientTransport`, where a given `env` is merged onto `getDefaultEnvironment()` because the MCP SDK would otherwise replace the child's entire environment. Every server connects eagerly (listing tools needs a live connection); afterwards `lazy` (default `true`) reconnects transparently on the next call after `close()` or a drop — `client.onclose` marks the connection closed. `onError: 'skip'` leaves a failing server out with a warning; `'throw'` closes everything and rethrows.
+
+**Loading tools.** `loadMcpTools(client, connectionName, options)` calls `listTools()`, then builds a `NamedToolDescriptor` per remote tool via `toolDescriptorFromSchema()`: `jsonSchemaToZod()` converts the remote `inputSchema` (permissively — unknown keywords, deep nesting past 64, unresolvable `$ref`s all degrade to `z.any()` rather than throwing), `displayName` prefers `annotations.title`, and `execute` calls `client.callTool()` with the **raw** (unprefixed) name — the namespaced `server__tool` key is purely a local registration concern so two servers advertising `search` can never collide. A tool whose schema can't convert is skipped with a `logger.warn` + `onSkip` callback and never blocks the rest.
+
+**Results.** `handleCallToolResult()` normalizes the raw `CallToolResult`: `isError: true` throws `McpToolError` (which declares `toolErrorKind: 'mcp'`, so the model sees `{ error: 'McpToolError', kind: 'mcp', ... }`); `structuredContent` wins when present; otherwise `{ text, content }` keeps every content part — text joined with newlines, image/audio/resource parts preserved, unknown part types kept under `{ type: 'unknown', raw }`.
+
+**Approval defaults from annotations (LOU-Z5).** `McpApproval` defaults to `'annotations'`: `readOnlyHint: true` runs without asking; `destructiveHint` true *or absent* (the MCP spec's default) asks; `destructiveHint: false` runs. `'always'`/`'never'`/a predicate override per server. A server entry's `deferLoading: true` marks every loaded descriptor `deferLoading` (see [tool search](/tools/tool-search)).
+
+**OAuth (N9c).** The MCP SDK does the protocol — RFC 9728/8414 discovery, RFC 7591 dynamic registration, PKCE, RFC 8707 resource indicators, refresh. `mcpOAuth.ts` supplies its `OAuthClientProvider` (`storeOAuthProvider`) backed by the agent's `OAuthTokenStore` under provider `mcp-<server>`, owner `'app'`. Constraints enforced up front: `oauth` requires https (http only on loopback), forbids a configured `Authorization` header, and requires a token store (`LOUSHO_OAUTH_STORE_MISSING`). The grant is bound to the configured `url` — change it and the stored client/grant are ignored. A *connection*'s provider never starts an interactive sign-in: where the SDK would redirect, it throws `LoushoMcpNeedsSignIn`, the status becomes `'needs-auth'`, and the call fails with `LOUSHO_MCP_AUTH_REQUIRED` naming `agent.oauth.mcpSignInUrl(name)`. `startMcpSignIn()` runs discovery/registration, parks the PKCE verifier in a `PendingSignIn` record keyed by a random `state`, and returns the authorization URL; `completeMcpSignIn()` does the code exchange on callback. No token, verifier, or client secret reaches an error message, log, or `status()`.
+
+**Agent wiring.** `createAgent({ mcpServers })` becomes `agentMcp()`: a `lazyValue` connects on `agent.ready()` (or the first `send()`/`stream()` via `streamAfter`), registers `connections.tools`, and `agent.close()` disconnects — a failed connect isn't cached, so the next call retries.
+
+**Server side.** `serveMcp({ agent, name, tools, transport })` builds an `McpServer` exposing the agent as ONE tool (`sanitizeToolName(name)`, input `{ message: string }` — each MCP call is a fresh stateless conversation, and `extra.signal` cancels the run). `tools` exposes `defineTool()` results directly: they must have `z.object` inputs and unique names, and a `needsApproval` tool is *dropped* unless `allowApprovalTools` — which also warns once, because MCP has no approval step, so enabling it runs those tools with no human gate. An agent run that ends `awaiting-approval`/`aborted`/`max-steps`/`error` maps to an `isError` text result. `toolAnnotations()` advertises a tool's own `annotations` verbatim but a gated tool is always sent `readOnlyHint: false, destructiveHint: true` — never read-only. Transports: `'stdio'` (default), or `{ type: 'http', port, host, path, auth }` — a `node:http` listener, stateless per the MCP SDK's recommendation (one `McpServer` + `StreamableHTTPServerTransport` pair per request, `sessionIdGenerator: undefined`), POST-only, 4 MB body cap, optional bearer auth via `checkWebhookAuth`, binding `127.0.0.1:3920/mcp` by default with a warning when non-loopback has no auth.
+
+## Design decisions
+
+- **Structural `McpClientLike`, not `Pick<Client, ...>`.** The published `.d.ts` must not import the optional peer — a consumer without `@modelcontextprotocol/sdk` installed would hit TS2307 inside the SDK's own declarations under `skipLibCheck: false`. A real `Client` satisfies the shape.
+- **Permissive schema conversion.** Argument validation happens against the converted zod schema, so a too-strict converter would reject calls the server accepts; `z.any()` fallbacks mean a weird schema degrades gracefully.
+- **Annotations drive approval by default.** MCP servers already declare intent; honoring `readOnlyHint`/`destructiveHint` (spec default: destructive ⇒ ask) means zero-config safe behavior. This was a documented breaking change (LOU-Z5).
+- **OAuth is operator-driven, never interactive mid-run.** A connection can't pop a browser; `needs-auth` status + an explicit `mcpSignInUrl` step keeps long-running agents deterministic and headless-friendly.
+- **Stateless HTTP serving.** Per-request server/transport pairs sidestep session lifecycle; agent calls are stateless anyway (each `{message}` is a fresh conversation).
+
+## Example
+
+```ts
+import { connectMcp, createAgent, serveMcp } from '@lousho/build-ai-agent';
+
+const mcp = await connectMcp({
+  github: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-github'] },
+  docs:   { url: 'https://example.com/mcp', oauth: { redirectUri: 'https://agent.example.com/cb' } },
+}, { onError: 'skip', logger: console });
+// mcp.tools: { 'github__search': ..., 'docs__query': ... }; mcp.status() per server
+
+const agent = createAgent({ model: 'openai/gpt-4o-mini', tools: mcp.tools });
+const server = await serveMcp({ agent, name: 'support-bot' }); // stdio
+```
+
+## Where next
+
+- [Tool system](/tools/tool-system) — the descriptor contract MCP tools land in.
+- [Tool search](/tools/tool-search) — `deferLoading` for big MCP tool lists.
+- [OpenAPI tools](/tools/openapi-tools) — shares `jsonSchemaToZod` and the descriptor path.
+- `docs/mcp.md`, `docs/oauth.md` — user-facing flows.

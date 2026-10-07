@@ -1,0 +1,60 @@
+---
+title: "Tool search"
+description: "Deferred tool loading: why not every tool is in the prompt, the threshold math, transcript-derived loading state, and the default keyword ranker."
+---
+
+Large tool sets cost prompt tokens on *every* model call — a hundred tool definitions might be tens of thousands of tokens paid per turn, plus prompt-cache churn. Tool search (N2) withholds definitions marked `deferLoading` and gives the model a `tool_search` tool to find them on demand. The notable design choice: "which tools are loaded" is *derived from the transcript*, not stored state.
+
+## Entry points
+
+- `src/execution/toolSearch.ts` — `withToolSearch()` (run-start wiring), `ToolSearchOptions`, `ToolSearchResult`, `assertToolSearchOptions()`, `jsonSchemaOf()`; internals `definitionTokens()`, `promptBlock()`, `createToolSearchTool()`.
+- `src/execution/toolDeferral.ts` — `TOOL_SEARCH_TOOL` (`'tool_search'`), `ToolDeferral`, `deferralOf()`/`withDeferral()` (per-run symbol-keyed options), `loadedToolNames()`, `visibleTools()`.
+- `src/tools/toolSearchRank.ts` — `rankToolsByKeywords()`, `searchWords()`, `SearchableTool`.
+- `src/tools/defineTool.ts` — the `deferLoading` option; `src/tools/mcp/connect.ts:190` — per-server `deferLoading`.
+- `src/skills/withSkills.ts` — `withPromptTool()` (shared helper that registers a tool + appends a prompt block).
+- `src/execution/AgentExecutor.ts:681` — where `withToolSearch()` runs in the run pipeline.
+
+## How it works
+
+**Marking.** `defineTool({ deferLoading: true })` sets `descriptor.deferLoading`; `connectMcp`/`createAgent({ mcpServers })` mark every tool of a server with `deferLoading: true`. `NEVER_DEFERRED` (`load_skill`, `task`, `ask_question`, `tool_search`) ignores the flag — tools that *load other things* must always be visible. The `toolSearch` option itself lives on `createAgent()` and on `ExecuteOptions` (`AgentExecutor.execute`), so a run can tune or disable (`false`) it independently.
+
+**Activation is gated by a threshold.** At run start `withToolSearch()` collects the deferred `ToolDefinition`s; if none exist or `toolSearch: false`, it's a no-op. Otherwise it estimates the deferred definitions' token cost — `JSON.stringify({name, description, parameters-as-JSON-Schema})` through `jsonSchemaOf()` + `estimateTokens()` — and compares against `thresholdPercent` (default 0.1) × `contextWindow` (from `toolSearch.contextWindow`, the model registry, or 128k fallback). Below the threshold nothing is deferred: the point is saving tokens, and deferral below ~10% isn't worth the extra round-trip. When it does apply, a name clash with a user-registered `tool_search` throws `LOUSHO_CONFIG_INVALID`.
+
+**Prompt + tool injection.** `withPromptTool()` copies the registry, registers `tool_search` (`{ query }` → `ToolSearchResult { loaded: [{name, description}], more }`), and appends a `## Tool search` block to the system prompt naming the counts per source — `metadata.mcp.server` groups MCP tools so the model sees "47 more tools are available but not loaded yet (40 from the MCP server 'github', 7 others)".
+
+**Per-call visibility.** `visibleTools()` filters the run's full tool list for each `generate()`: non-deferred tools always, deferred tools the transcript has loaded, and `tool_search` itself only while some deferred tool is still unloaded. After preGenerate hooks run, `reloadTools()` recomputes the list — a compaction hook that pruned a `tool_search` result unloads its tools from that call on.
+
+**Loading is transcript-derived.** `loadedToolNames()` scans messages after the last handoff marker for successful `tool_search` *tool* messages and parses `loaded[].name` out of their JSON content. Consequences, all deliberate: loading survives crash resume, approval pauses, and forks with zero extra state; compaction that prunes a result genuinely unloads the tools; a handoff target or sub-agent starts with nothing loaded (it gets its own deferral). Failed or content-replaced `tool_search` messages load nothing.
+
+**Ranking.** Default `rankToolsByKeywords()`: `searchWords()` splits names and descriptions on non-alphanumerics *and* camelCase boundaries, lowercases, drops English stop words, and stems naive plurals (`tools`→`tool`, `currencies`→`currency`). Score = 3 per query word in the name + 1 per word in the description; zero-score tools are dropped, ties sort by name. No index, no dependency — deferred sets are tens to a few hundred tools. `toolSearch.search` swaps in a custom ranker (embedding service, etc.); unknown names and duplicates in its output are dropped, a throwing ranker becomes a tool error (`toolFailure`, so the model sees it and can retry). `maxResults` (default 5) caps how many tools one search loads, and the result's `more` count tells the model how much is still hidden.
+
+## Design decisions
+
+- **Transcript as source of truth.** Persisted "loaded" flags would drift across resume/fork/compaction; deriving from the (already durable, already prunable) transcript makes loading behave correctly for free in every state transition.
+- **Threshold by token share, not count.** "Too many tools" is a context-window problem; 20 tools on a 1M-window model are fine, 20 on a 32k one aren't.
+- **Keyword ranking by default.** At this scale an embedding pipeline adds a dependency and a failure mode for no measurable gain; `search` is the escape hatch for catalogs where it matters.
+- **`tool_search` disappears when done.** Once everything is loaded the search tool stops being sent — no dead tool in the list.
+- **Prompt-cache tradeoff is explicit.** The loaded set is monotonic within a transcript segment, so the tool list changes only on a successful search — but providers cache tool definitions at the front of the request prefix, so each load can miss the cache from that point. Loading happens a few times per run at most; runs that reuse a long cached prefix across many calls may do better with `toolSearch: false`.
+
+## Example
+
+```ts
+const mcp = await connectMcp({
+  github: { command: 'npx', args: ['-y', 'some-big-server'], deferLoading: true },
+});
+
+const agent = createAgent({
+  model: 'openai/gpt-4o-mini',
+  tools: [mcp.tools, myTool],
+  toolSearch: { maxResults: 3 }, // or false to disable deferral entirely
+});
+// Model sees myTool + tool_search; a search for "create issue" loads github__create_issue.
+```
+
+## Where next
+
+- [Tool system](/tools/tool-system) — `deferLoading` on `defineTool`.
+- `src/execution/toolDeferral.ts` — the smallest file in the pipeline; read it first to see the per-call contract.
+- [MCP](/tools/mcp) — per-server `deferLoading` and `metadata.mcp.server` grouping.
+- [Code mode](/tools/code-mode) — `run_code` excludes deferred tools by default.
+- `docs/tool-search.md` — user-facing tuning guide.

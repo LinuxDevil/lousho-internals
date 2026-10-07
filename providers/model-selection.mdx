@@ -1,0 +1,66 @@
+---
+title: "Model selection and spec resolution"
+description: "How 'provider/model' strings, LOUSHO_MODEL and env keys resolve to a provider instance — and which model id a given call actually uses."
+---
+
+Three different questions are answered in three different places: which provider (the `'provider/model'` spec or `provider:` instance), which credential (a per-provider env var), and which model id reaches the wire (`agent.settings.model` > provider's `defaultModel` > the provider's built-in default). The resolution machinery lives in `src/providers/providerSpec.ts`.
+
+## Entry points
+
+- `resolveProvider('openai/gpt-4o-mini')` — `src/providers/resolveProvider.ts`, a one-line wrapper over `resolveProviderSpec()`.
+- `createAgent({ model })` — calls `resolveProviderSpec(spec, 'createAgent', LLMProviderRegistry, { maxRetries: 0 })` in `resolveModelSource()` (`src/createAgent.ts`); the `caller` argument only prefixes error text.
+- `modelFromEnv(caller)` — `providerSpec.ts`: `LOUSHO_MODEL` wins, else the first provider whose env var is set, in `PROVIDERS` order.
+- `detectProviderFromEnv(env)` — same order, returns just the provider name; `lousho init --yes` uses it.
+- `listProviders()` / `findPeerPairing()` / `peerInstallCommand()` — the data `lousho doctor` and install hints read.
+- `resolveModel()` — `src/execution/generateStep.ts`: per-call precedence inside the executor.
+
+## How it works
+
+**The provider table** (`PROVIDERS`, `providerSpec.ts`) is the single source of truth, in env-detection order:
+
+| Prefix | Env var | Injected as | Required | Peer per `ai` major | Env default model |
+|---|---|---|---|---|---|
+| `openai` | `OPENAI_API_KEY` | `config.apiKey` | yes | `@ai-sdk/openai` 0.0.x/1.x · 3.x · 4.x | `gpt-4o-mini` |
+| `anthropic` | `ANTHROPIC_API_KEY` | `config.apiKey` | yes | `@ai-sdk/anthropic` 0.0.x/1.x · 3.x · 4.x | `claude-3-5-sonnet-latest` |
+| `openrouter` | `OPENROUTER_API_KEY` | `config.apiKey` | yes | `@ai-sdk/openai` (same package) | `openai/gpt-4o-mini` |
+| `ollama` | `OLLAMA_BASE_URL` | `config.baseURL` | no (local default) | `ollama-ai-provider` (ai 4) / `-v2` (ai 6/7) | `llama3` |
+| `pi` | `OPENROUTER_API_KEY` | **not injected** (`envForInfoOnly`) | no | `@earendil-works/pi-ai` | `openrouter/openai/gpt-4o-mini` |
+
+`resolveProviderSpec()` then:
+
+1. Splits on the **first** `/` — everything after it is the model id, slashes included (`pi/openrouter/openai/gpt-4o-mini` keeps `openrouter/openai/gpt-4o-mini` as pi's nested model spec).
+2. Unknown prefix → `LOUSHO_PROVIDER_UNKNOWN` with the closest match suggested (`closestMatch`).
+3. Reads `process.env[envKey]` and injects it into `config.apiKey`/`config.baseURL` — except `pi`, whose env var only describes detection (`envForInfoOnly`): injecting `OPENROUTER_API_KEY` into a `pi/anthropic/...` config would send the wrong credential. Pi resolves each nested provider's env itself ([pi](/providers/pi)).
+4. Missing required key → `LOUSHO_PROVIDER_MISSING_API_KEY`, unless `LOUSHO_EVAL_CASSETTES` is `replay`/`auto` — then an `uncalledProvider()` wrapper is returned that keeps `name`/`defaultModel` but rejects any real call with the same missing-key error (a cassette may answer everything).
+5. `LLMProviderRegistry.create()` throwing `MODULE_NOT_FOUND`/`ERR_MODULE_NOT_FOUND` is rethrown as `LOUSHO_PEER_MISSING` with an install hint **per `ai` major** (`installHintPerMajor`).
+
+**Model precedence per call** — `resolveModel()` in `generateStep.ts` sets `GenerateOptions.model` to `agent.settings.model || provider.defaultModel`; a provider left without either falls back to its own `fallbackModel` inside `AiSdkProvider.defaultModel`. Nothing ever hard-codes a model (the `modelSelection.test.ts` contract test pins this). With `withFallback()`, the call's `model` goes only to the first provider and only when it differs from the wrapper's `defaultModel`; fallbacks use their own defaults.
+
+## Design decisions
+
+- **First-slash split.** Provider prefix is `spec.slice(0, indexOf('/'))` — nested ids (OpenRouter's `vendor/model`, pi's `provider/model`) need no escaping.
+- **Env detection order is fixed and documented.** `modelFromEnv` walks `PROVIDERS` in declaration order and ignores `LOUSHO_MODEL`-unset ambiguity by failing loudly (`LOUSHO_CONFIG_MISSING_PROVIDER` lists all four fixes).
+- **`pi` last in detection.** Its env key is `OPENROUTER_API_KEY`, shared with `openrouter` — listed last so plain `openrouter` wins detection; the var is informational only.
+- **Registry miss → built-ins, then peer check.** Spec validity is checked before touching the registry, so a bad prefix never reaches `LLMProviderRegistry.create`.
+
+## Example
+
+```ts
+import { createAgent } from '@lousho/build-ai-agent';
+
+// spec string: env key injected, ai-SDK retries off, withRetry({maxRetries:2}) on top
+const a = createAgent({ model: 'openrouter/openai/gpt-4o-mini' });
+
+// instance + bare model id: the agent's settings.model wins at call time
+import { resolveProvider } from '@lousho/build-ai-agent';
+const b = createAgent({ provider: resolveProvider('openai/gpt-4o-mini'), model: 'gpt-4o' });
+
+// neither: LOUSHO_MODEL, else first env var in PROVIDERS order
+const c = createAgent({ instructions: 'You are helpful.' });
+```
+
+## Where next
+
+- [Provider architecture](/providers/architecture) — the `LLMProvider` contract and registry.
+- [ai-sdk compat](/providers/ai-sdk-compat) — the peer-pairing matrix behind the install hints.
+- [pi](/providers/pi) — the nested `pi/<provider>/<model>` space and per-nested-provider credentials.

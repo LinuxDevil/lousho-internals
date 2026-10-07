@@ -1,0 +1,65 @@
+---
+title: "Registry and kits"
+description: "How lousho add installs registry items and whole-directory kits: the JSON registry format, safe-path writes, the install-time manifest check, lousho-registry.json bookkeeping, and runtime manifest enforcement."
+---
+
+A registry is plain static JSON — an `index.json` plus one document per item carrying the item's files inline. `lousho add <name>` copies those files into an agent directory as *source the owner now owns*: nothing from a registry is executed or imported during install. A `kit` item is a whole agent directory (its files may sit at any safe relative path), which is how `coding-kit`, `coding-pi`, `inbox-triage`, and `incident-response` ship complete harnesses under one permission manifest.
+
+## Entry points
+
+- `src/cli/registry.ts` — `IndexSchema`/`ItemSchema` (zod), `registrySource()` (`--registry` → `LOUSHO_REGISTRY` → `DEFAULT_REGISTRY` = `https://registry.lousho.com/index.json`; `'none'` disables), `loadIndex`, `loadItem`.
+- `src/cli/add.ts` — `runAdd`: the install pipeline and the `--allow` grant logic (`ELEVATED = exec, fs-write, network, env`).
+- `src/cli/addWrite.ts` — `planFiles`/`checkTargets`/`writeFiles`: safe-path validation and writes.
+- `src/cli/addCheck.ts` — `checkItem`: the install-time static check of code against `permissions`.
+- `src/cli/addReceipt.ts` — `RECEIPT_FILE = 'lousho-registry.json'`, `readReceipt`/`writeReceipt`.
+- `src/agentDir/registryEnforce.ts` — `verifyReceipt`, `registryWarnings`, `confineToolsToReceipt`: runtime enforcement wired into `loadAgentDir` (`src/agentDir/loadAgentDir.ts`).
+- `scripts/build-registry.ts` — builds `registry/dist/` from `registry/<name>/` source folders (`item.json` + files); `--check` fails on staleness.
+
+## How it works
+
+**The format.** Index: `{ items: [{ name, type, description, url | path }] }` — `type` ∈ `tool | skill | channel | schedule | memory | kit`; a relative `url`/`path` resolves against the index's own location. Item: `{ name, type, description, files: [{ path, content }], permissions, dependencies? }` where `permissions` declares `network` (host patterns — hostname or `*.` wildcard, no scheme/port/path), `env` (variable names `A-Z0-9_`), `filesystem: none|read|write`, `exec: boolean`, `needsApproval: boolean`. Reads are bounded: 15 s fetch timeout, 2 MB document cap; an item's declared `name`/`type` must match the index entry.
+
+**Install flow** (`add.ts`): parse → resolve registry → `loadIndex` → `--list` prints and exits, or `loadItem` (miss → `LOUSHO_REGISTRY_ITEM_NOT_FOUND` with a `closestMatch` did-you-mean). `install()` then:
+
+1. `planFiles` — every file path must be normalized, relative, free of NUL/`\\`/drive/`..`/`.`, and inside the folder its type owns: `tools/`/`channels/`/`schedules/`/`memory/`/`skills/<name>/`; a `kit` has no folder constraint (''). Caps: 256 KB per file, 1 MB per item.
+2. `checkTargets` — `realpath` the agent dir, `realAncestor` each target (a symlink escaping the dir is `LOUSHO_REGISTRY_UNSAFE_PATH`), refuse symlink targets, and require `--overwrite` for existing files (`LOUSHO_REGISTRY_FILE_EXISTS`).
+3. Print the manifest (elevated permissions marked `[elevated: ...]`), the planned files, and `dependencies` as an `npm install` line — deps are *printed*, never installed.
+4. `enforceManifest` — `checkItem` scans every JS/TS file with a small hand-rolled lexer (comments and string/template/regex text blanked, literals kept) and compares what the code visibly reaches for against the manifest: `child_process`/`execa`/`shelljs`/`createShellTool`/`SubprocessSandbox` needs `exec`; fs imports/`createFsTools` need `filesystem`; file-writing calls need `"write"`; `fetch(`/net modules need non-empty `network`; every literal `http(s)://` host must match a `network` entry; every `process.env.NAME` must be in `env`. `eval(`, `new Function(`, computed `process.env[...]`, and non-literal `import()`/`require()` are always refused. `refuse` findings abort with `LOUSHO_REGISTRY_MANIFEST_MISMATCH`; `note`s are printed.
+5. `--dry-run` stops here. `--yes` runs `enforceAllow`: each elevated permission the manifest asks (`exec: true`, `filesystem: "write"`, any `network`, any `env`) must appear in `--allow`. Without `--yes`, an interactive TTY gets a `[y/N]` prompt (non-TTY stdin is a usage error).
+6. `writeFiles`, then `writeReceipt` — records `{ v: 1, items: { <name>: { type, registry, installedAt, permissions, files: [{ path, sha256 }] } } }` in `lousho-registry.json`, sorted-key JSON.
+
+**Runtime enforcement** (`registryEnforce.ts`, wired in `loadAgentDir`): `verifyReceipt` re-hashes every receipt file — changed or missing files mark the item `unattested` (a printed warning per item; the load is *not* refused — the files are the owner's to edit). `confineToolsToReceipt` wraps each tool a receipt item owns so calls stay inside the last accepted manifest regardless of attestation:
+
+- `exec`/`needsApproval` manifests — and *any* unattested item — get `enforcedApproval`: every call asks (a tool's own `deny` still denies).
+- `network`: an `AsyncLocalStorage` envelope plus a one-time patch of `globalThis.fetch` limits fetches during the tool's `execute`/`sandboxExecute` to the declared hosts (async-generator bodies are confined per `next()`).
+- `env`: `process.env` becomes a Proxy showing only the declared names inside a confined call (Windows-insensitive).
+- `requiresSandbox` tools get a narrowed adapter: `run()` refused without `exec`, `writeFile()` without `filesystem: "write"`, command env = non-secret base + declared vars only.
+
+The envelope never widens on a stale receipt — `lousho add <name> --overwrite` re-attests the current files. Honest limits: the guards intercept `fetch` and `process.env`, not `http`/`net`/`axios`, the filesystem, or module-scope captures — a manifest is not a sandbox, which is why the static check exists alongside it.
+
+## Design decisions
+
+- **Copy-in, not plugin loading.** Installed code is the user's source to read, edit, and own; the receipt + enforcement exists so edits are *visible* (unattested → always-ask) rather than silently privileged.
+- **`--allow` grants are per-permission, per-invocation.** `--yes` alone never grants `exec`/`fs-write`/`network`/`env` — CI must name what it accepts, making the grant auditable in the command line.
+- **Kit = one manifest for a whole directory.** Kits inherit the same enforcement as single tools: `coding-kit` (`exec`, `fs-write`) installs with `lousho add coding-kit --dir <dir> --yes --allow exec,fs-write`; `coding-pi` adds `network api.openrouter.ai` + `env OPENROUTER_API_KEY`; `inbox-triage`/`incident-response` take `fs-write` + `env` lists.
+- **Registry build validates like the CLI** — `build-registry.ts` runs `planFiles` path rules and `checkItem` on every item, so a `refuse` finding fails the registry build before it can fail a user's install. Output is deterministic (sorted, LF) for `--check`.
+
+## Example
+
+```bash
+lousho add coding-kit --dir ./my-agent --yes --allow exec,fs-write
+# coding-kit/item.json -> tools/, skills/, subagents/, instructions.md, agent.json ...
+#   permissions: { exec: true, filesystem: "write" }
+# writes files + records sha256s in my-agent/lousho-registry.json
+
+lousho dev ./my-agent   # loadAgentDir: verifyReceipt + confineToolsToReceipt
+# editing an installed file later -> "[lousho] loadAgentDir: registry item
+# 'coding-kit' no longer matches its install receipt ..." and its tools always ask
+```
+
+## Where next
+
+- [Agent directories](/compose/agent-directories) — what a kit's files become once installed.
+- [The lousho CLI](/ship/cli) — `runAdd`'s place in command dispatch.
+- [Approvals](/core/approvals) — the `enforcedApproval` gate confined tools sit behind.
+- [Tool system](/tools/tool-system) — `DefinedTool.execute`/`sandboxExecute`/`needsApproval`, the seams enforcement wraps.

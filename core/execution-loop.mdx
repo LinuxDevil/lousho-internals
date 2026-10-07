@@ -1,0 +1,68 @@
+---
+title: "The execution loop"
+description: "Inside AgentExecutor.execute(): how one generate→tools step is built, how the loop iterates, and where a tool call flows through permissions, hooks, execution and checkpointing."
+---
+
+`AgentExecutor.execute()` is a static, instance-free entry point: everything a run needs is on `ExecuteOptions`, and the loop itself is a private pipeline on the class. One *step* is one `provider.generate()` call plus the tool calls that response asks for; the loop repeats until the model replies with text only, an early-exit condition (approval pause, abort, budget, guardrail) fires, or the step budget runs out.
+
+## Entry points
+
+- `AgentExecutor.execute(options)` / `.stream(options)` / `.fork(options)` — `src/execution/AgentExecutor.ts`.
+- `runAgentLoop` → `runSteps` → `runStep` → `generateOrSurfaceError` / `runToolCalls` / `runBatch` — the loop, same file.
+- `loadRunState`, `saveStepCheckpoint`, `pushToolResult`, `pushAbortedBatchResults`, `toExecutionResult` — per-run mutable state, `src/execution/agentRunState.ts`.
+- `prepareGenerateRequest`, `generateInSpan` — the model-call half of a step, `src/execution/generateStep.ts`.
+- `runToolCall`, `prepareToolCall`, `settleToolCall` — the per-call gate, `src/execution/toolCallExecution.ts`.
+- `runToolBatch`, `Limiter` — the concurrency scheduler, `src/execution/toolBatch.ts`.
+
+## How it works
+
+**Setup.** `execute()` validates the three required options (`provider`, `agent`, `input`) up front so missing fields fail with a named `ConfigurationError` rather than a `TypeError` deep in the loop. `observeRun()` then attaches the run's event sink (`RUN_EVENTS` symbol key) so every later stage reports through one channel, and `withSpan` wraps the whole run in an `invoke_agent` span. `runWithEnd` starts the `limits` budget (`startBudget` may wrap `signal` with the `maxDurationMs` timer) and calls `extendRunOptions`, which composes skills, sub-agents, tool search, code mode, the plan-mode paragraph and the `output` instruction onto the agent before the loop sees it.
+
+**Loop entry.** `runAgentLoop` emits `run.start`, builds the tool list (`runTools` adds one tool per handoff), loads state via `loadRunState` (fresh, or rehydrated from a checkpoint — see [durable execution](/core/durable-execution)), checks agent drift on resume, and runs input guardrails. If a rehydrated transcript ends in unanswered tool calls (`state.pendingToolCalls`), `runPendingToolCalls` finishes them *before* any new model call — a resume never re-asks the model for a turn it already made.
+
+**One step.** `runSteps` loops `while (state.steps < maxSteps)`:
+
+1. `stopBeforeStep` — abort if `signal` fired, or stop if `budget.check` tripped.
+2. `state.steps++`, then `applyQueuedInput` appends anything `run.enqueue()`/`steer()` left.
+3. `runStep` → `generateOrSurfaceError`: `prepareGenerateRequest` builds `GenerateOptions` (tools filtered by deferral and by plan mode for hosted tools), runs `onLLMRequest` and `preGenerate` hooks; `generateInSpan` calls the provider inside a `chat` span, then `onLLMResponse` and `postGenerate`.
+4. Usage is recorded (`recordStep`), output guardrails check the text, `assistantTurn()` pushes the assistant message (keeping signed reasoning blocks for the next request).
+5. With tool calls: `runToolCalls` checkpoints the turn **before any tool runs**, then `runBatch` schedules the calls.
+
+**A tool call's path** (`prepareToolCall`, toolCallExecution.ts): `onToolCall` → parse + schema-validate args → `preToolCall` hooks (may `deny`, supply `{ result }`, or rewrite `{ input }`, re-validated) → permission rules (`checkPermission` → allow/deny/ask) → tool guardrails → the tool's own `needsApproval` → permission-mode verdict, applied last and never un-denying. A call that clears the gate runs via `executeToolWithSandboxGuard`; `postToolCall` hooks may replace the result; `onToolResult` fires from a `finally`.
+
+**The batch** (`runToolBatch`): calls start in call order, each only after the previous call's *gate* resolved — so the first approval-needing call is known before anything after it starts — and concurrency slots come from `Limiter` (`toolConcurrency`, default `'unbounded'`). Results are appended to the transcript in call order as the completed prefix grows, and each grown prefix is checkpointed. `settleToolBatch` then decides: abort (finished calls keep results, the rest get `kind: 'not-run'` results), rethrow the first fatal error, pause for sign-in or approval, settle sub-agent suspensions, or hand off. Handoff calls are split out (`splitHandoffCalls`) and gated but never executed — a cleared one switches the run's options (`state.switched`) and the loop continues as the target.
+
+**Step outcomes.** `runStep` returns `'continue'` (another iteration), `'stop'` (text-only reply → `checkOutput` → `finishRun`), `'steered'` (the model call was aborted by `run.steer()`; retry with the new input), or an `ExecutionResult` for an early end.
+
+## Design decisions
+
+- **Checkpoint before tools, results in call order.** The model's turn is saved before its first tool runs, so a crash mid-batch resumes by *running the calls*, never by re-generating. Results append in model order (not completion order) so the next provider request is deterministic — a correctness requirement for replay and cassettes.
+- **Gate-then-start ordering.** Starting call *n+1* only after call *n*'s gate settled makes "the first call that needs approval stops the batch" cheap and exact; it also means an approval never starts behind a later side-effecting call.
+- **`lastSurfacedProviderError`.** With `surfaceRetryableProviderErrors`, a compacted provider failure becomes a user message and costs a step; if `maxSteps` is then exhausted, `finishRun` rethrows that error instead of returning a hollow result whose `finishReason` would lie about a real model stop.
+- **Instance-free statics.** No executor object to construct or leak: per-run state lives in `AgentRunState`, and cross-run identity is `sessionId` + stores, which is what makes durable resume a data problem rather than an object-lifetime problem (inferred rationale; consistent with the LOU-U8 comments).
+
+## Example
+
+```ts
+import { AgentExecutor } from '@lousho/build-ai-agent/executor';
+
+const result = await AgentExecutor.execute({
+  agent,
+  input: 'Compare the three cities',
+  provider,
+  toolRegistry,
+  toolConcurrency: 2,
+  maxSteps: 10,
+  signal: AbortSignal.timeout(60_000),
+});
+
+// result.finishReason: 'stop' | 'tool_calls' | 'awaiting-approval' |
+// 'aborted' | 'max-steps' | 'budget-exceeded' | 'guardrail' | 'output-invalid' | 'error'
+```
+
+## Where next
+
+- [Run lifecycle](/core/run-lifecycle) — the start-to-settle state machine around this loop.
+- [Approvals](/core/approvals) — what `pauseForApproval` stores and how resume re-enters.
+- [Streaming events](/core/streaming-events) — the sink the loop reports through.
+- [Durable execution](/core/durable-execution) — the checkpoint writes inside the loop.

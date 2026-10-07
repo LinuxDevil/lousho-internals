@@ -1,0 +1,26 @@
+---
+title: "Release process"
+description: "How alphas ship: version bump, publish smoke, tags, and the release branch convention."
+---
+
+Releases cut from short-lived `release/sdk-alpha<N>` branches. A release commit is `chore: release @lousho/build-ai-agent X.Y.Z-alpha.N, create-lousho-agent V` — it bumps `package.json` `version`, `src/index.ts` `VERSION`, the lockfile, and the `create-lousho-agent` template pin in one commit.
+
+## Pipeline
+
+<Steps>
+  <Step title="Branch">`release/sdk-alpha<N>` from the feature branch being shipped.</Step>
+  <Step title="Bump">version, `VERSION` constant, lockfile, template pin — one commit.</Step>
+  <Step title="Smoke">`npm run pack-smoke` — packs the tarball, installs it into a clean project, imports ESM + CJS, runs `lousho --help` and `lousho doctor`.</Step>
+  <Step title="Publish">`npm publish` (dry-run first). The tarball size is budget-checked by pack-smoke.</Step>
+  <Step title="Tag + merge">`v1.0.0-alpha.N` tag; the release branch merges to `main` via PR.</Step>
+</Steps>
+
+## What CI protects on every PR
+
+- Full gate list from [dev workflow](/dev-workflow): lint, typecheck, tests, `api:check`, `docs:llms:check`, snippet verification, fallow, pack-smoke.
+- Peer matrix: `ai@4/6/7` × `zod@3/4` — a feature must work across all supported pairings.
+- `e2e-studio` — the Agent Forge app exercises the SDK end to end.
+
+## Versioning
+
+`1.0.0-alpha.*` line until the 1.0 cut. Public-API removals/renames must land before 1.0 or go through deprecation — `docs/upgrading.md` tracks the moved surface, and `api/*.api.md` diffs are the contract.

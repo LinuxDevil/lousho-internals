@@ -1,0 +1,37 @@
+---
+title: "Introduction"
+description: "Contributor onboarding for the Lousho TypeScript AI agent SDK — how it's built, why it's built that way, and where everything lives."
+---
+
+This site documents the **internals** of [`@lousho/build-ai-agent`](https://github.com/LinuxDevil/agent-sdk): the TypeScript SDK for agents that run in your own Node process — tool calling, MCP, sessions that survive a restart, human approvals, and OpenTelemetry. No hosted runtime.
+
+The [user docs](https://lousho.com/introduction) teach *using* the SDK. These pages teach *changing* it: every subsystem's entry points, control flow, and the design decisions a contributor needs before touching the code.
+
+## Reading order
+
+<Steps>
+  <Step title="Architecture">
+    The ten-minute map: how a user message becomes model calls, tool calls, approvals, checkpoints and streamed events.
+  </Step>
+  <Step title="Repo map + dev workflow">
+    Where each subsystem lives under `src/`, and the local gate loop (`typecheck`, `vitest`, `docs:verify-snippets`, `fallow`, `api:check`) that CI enforces.
+  </Step>
+  <Step title="Your subsystem's page">
+    Execution core, sessions, providers, tools, composition, interfaces, ship, quality — one page per module, each ending in pointers to the source.
+  </Step>
+  <Step title="Design decisions">
+    The ADR-style pages: durable-by-default, error codes, branded types, the peer-dependency strategy, typed decisions, flow-vs-loop.
+  </Step>
+</Steps>
+
+## The one-sentence architecture
+
+```text
+user input ─► AgentExecutor (run loop)
+                │  model turn ─► provider (ai SDK / pi / openrouter / ollama)
+                │  tool call  ─► permissions → hooks → tool → checkpoint
+                │  pause?     ─► approval store (durable) ─► resume later
+                └── events    ─► versioned JSON stream ─► SSE / UI bindings
+```
+
+Everything in the SDK hangs off that loop. [Architecture](/architecture) walks it end to end.
