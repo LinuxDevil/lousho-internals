@@ -1,0 +1,59 @@
+---
+title: "Typed decisions"
+description: "Decide, don't generate — the {action, confidence} schema pattern and the decide() fast path for the OpenAI Decisions API."
+---
+
+## The pattern
+
+Some steps shouldn't generate prose — they should *decide*. The typed-decision pattern (TypeSafe's Jev builds a whole model on it): unstructured state in, a typed `{ action, confidence, reason }` out, and the workflow branches on it — including a confidence floor that routes low-confidence calls to a human instead of acting on a guess.
+
+Two implementations in the SDK, same pattern:
+
+| Path | Mechanism | When |
+|---|---|---|
+| `output` schema + `oneOf` | Any provider; the deciding agent returns validated JSON the flow branches on | Provider-agnostic; inside a larger pipeline |
+| `decide()` | `POST /v1/decisions` — predicate / choice / score / refusal types, ~10× faster, no generated prose | OpenAI only (beta); standalone classify/route/score |
+
+## Why it's built this way
+
+- **Confidence is data, not vibes.** `confidence < 0.7 → human queue` only works because `output` validation guarantees the field exists and is numeric — a prose "I'm fairly sure" can't gate a branch. [Structured output](/providers/structured-output) is what makes the floor enforceable.
+- **`decide()` is a client, not a provider.** The Decisions endpoint isn't chat-completions — no tools, no streaming, and OpenRouter can't reach it — so it deliberately bypasses the provider abstraction instead of pretending to be a model. See [decisions](/providers/decisions) and the [ADR](/design/typed-decisions).
+- **A decision can't skip the gate.** The `coding-agent-workflows` example routes `patch` through the same approval/permission machinery as any other tool call — typed decisions select the path; they don't loosen it.
+
+## How it composes
+
+```ts
+const triage = createAgent({
+  provider,
+  output: z.object({
+    action: z.enum(['patch', 'ask-human', 'wontfix']),
+    confidence: z.number(),
+    reason: z.string(),
+  }),
+});
+// flow: llmCall → outputVariable: d
+// oneOf: 'd.action === "patch" && d.confidence >= 0.7' → implement
+//        'd.action === "patch"'                         → humanReview
+//        'd.action === "wontfix"'                       → close
+```
+
+Or the dedicated endpoint:
+
+```ts
+const { answers } = await decide({
+  input: ticketText,
+  questions: [{ type: 'choice', name: 'route', instructions: 'Which team?',
+    choices: [{ value: 'billing' }, { value: 'other' }] }],
+});
+```
+
+## Examples
+
+- `examples/coding-agent-workflows/` — deterministic workflow whose branch points are typed decisions; live-validated (`fix @ 0.9`)
+- `examples/workflow-router/` — routing by classified intent
+
+## Where next
+
+- [decide() internals](/providers/decisions) — request/response shapes, error codes
+- [Structured output internals](/providers/structured-output) — repair retry, `output-invalid`
+- [Flows](/compose/flows) — the `oneOf` the decisions feed

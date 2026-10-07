@@ -1,0 +1,60 @@
+---
+title: "Context engineering"
+description: "The four operations — write, select, compress, isolate — and the internals page behind each one."
+---
+
+Context engineering is the second layer: deciding what fills the context window on any given turn. The SDK splits it into four operations, each with dedicated machinery — knowing which operation is failing is the diagnostic skill.
+
+## Write — persist outside the transcript
+
+Information that must outlive the turn is written to memory or stores, not left in the conversation.
+
+- `defineMemory({ name, scope, itemsProvider })` → `remember_<name>`/`recall_<name>` tools, bound per-run on `RunToolRegistry` and marked `transient`
+- scopes: `global`, `session:<id>`, or a function of the run context — the scope key decides who shares the slot
+- recall is a `preGenerate` hook injecting `<memory name="…">` blocks into `messages[0]`
+
+Internals: [memory](/state/memory), [storage stores](/state/storage-stores).
+
+## Select — load only what's relevant now
+
+- **Skills** — `load_skill` progressive disclosure: names/descriptions in the prompt, bodies on demand ([skills](/compose/skills))
+- **Tool search** — `toolSearch` defers tool definitions; `visibleTools`/`loadedToolNames` are transcript-derived so they survive resume and reset on handoff ([tool search](/tools/tool-search))
+- **Memory scopes** — only the relevant scope's `recall_*` is offered
+
+## Compress — shrink what's there
+
+`createCompactionHook` is a `preGenerate` hook firing at 0.9 × context window:
+
+- stage 1: `prune-tool-results` markers replace old tool output
+- stage 2: `summarize`/`twoPhaseStrategy` folds atomic assistant+results groups into a summary, spliced in place into `ctx.request.messages`
+- a rejected summary falls back via a `WeakSet` (LOU-R11); `session.compact()` forces it with `thresholdPercent: 0`
+
+Internals: [compaction](/state/compaction). Handoffs compress at the boundary with `inputFilter`.
+
+## Isolate — run work in a clean context
+
+- **`task` sub-agents** see only their prompt — search dumps, file reads and subprocess output never flood the lead's transcript ([sub-agents](/compose/subagents))
+- **code mode** — `run_code` executes a script in a QuickJS isolate and returns one value; the intermediate calls stay inside ([code mode](/tools/code-mode))
+- **handoff `inputFilter`** — the receiving agent gets a filtered transcript, not the whole history ([handoffs](/compose/handoffs))
+
+## The practical ordering
+
+Write durable facts to memory → select skills/tools on demand → compress when the transcript grows → isolate anything token-hungry behind a sub-agent or digest-returning tool.
+
+## Example
+
+```ts
+const agent = createAgent({
+  provider,
+  instructions: 'You triage inbound email.',
+  skills: await loadSkills('./skills'),              // select
+  toolSearch: { thresholdPercent: 0.1 },             // select
+  compaction: { summarizer: 'openai/gpt-4o-mini' },  // compress
+  subagents: { researcher: researchAgent },          // isolate
+});
+```
+
+## Where next
+
+- [Context assembly](/state/context-assembly) — `extendRunOptions` ordering: skills → subagents → toolSearch → codeMode → plan/output
+- [Techniques overview](/techniques/overview) — where this layer sits

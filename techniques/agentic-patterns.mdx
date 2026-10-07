@@ -1,0 +1,43 @@
+---
+title: "Agentic workflow patterns"
+description: "The canonical multi-call shapes — chaining, routing, parallelization, orchestrator-workers, evaluator-optimizer — plus the autonomous loop and handoffs."
+---
+
+The third layer: patterns that span multiple model calls. Each is a shape over the same primitives — `llmCall`/`oneOf`/`parallel` flow nodes, `task` sub-agents, handoffs — so the page maps shape → machinery → example → internals.
+
+## The canonical five
+
+| Pattern | Shape | Machinery | Example | Internals |
+|---|---|---|---|---|
+| Prompt chaining | step → step → step | `sequence` of `llmCall` nodes, `{{var}}` interpolation | `ops-pipeline` | [flows](/compose/flows) |
+| Routing | classify → dispatch to specialist | `llmCall` → `oneOf`; durable: handoffs | `workflow-router`, `support-desk` | [flows](/compose/flows), [handoffs](/compose/handoffs) |
+| Parallelization | N calls at once, results merged | `parallel` flow node, or N `task` calls (`toolConcurrency` unbounded) | `waves` | [sub-agents](/compose/subagents) |
+| Orchestrator-workers | lead decomposes, workers execute | lead `task` fan-out + aggregation turn | `deep-research` | [sub-agents](/compose/subagents) |
+| Evaluator-optimizer | draft → score → revise loop | `llmCritique` feedback re-seeded per iteration | `evaluator-loop` | [evals](/quality/evals) |
+
+## The autonomous loop
+
+The default `createAgent` tool loop *is* a pattern — ReAct: reason, act, observe, repeat. Bounded by `maxSteps`, `limits`, permissions and approvals. Internals: [execution loop](/core/execution-loop), [run lifecycle](/core/run-lifecycle).
+
+Two refinements worth naming:
+
+- **Bounded retry ladder** — an explicit `oneOf` chain (attempt → check → attempt → check) instead of an open `while`. The `phase-pipeline` example uses this because `FlowExecutor` has no runtime `loop` node — see [flow vs. loop](/design/flow-vs-loop).
+- **Steer** — `run.steer()`/`session` turn policies inject user input mid-loop; the model call aborts and the step retries with the queued input (`'steered'` outcome).
+
+## Handoffs
+
+Routing where control *transfers* wholesale — `transfer_to_<name>` is gated like a tool but executed as a switch of `state.options` to the target agent. `activeAgentOf` markers resume the right agent after a restart; `maxHandoffs` (default 5) bounds the walk. Internals: [handoffs](/compose/handoffs).
+
+## Choosing the shape
+
+- Order must hold → **flow** (the model can't skip a phase)
+- Model should improvise within bounds → **agent loop** + tools
+- Fan-out then converge → **parallel/`task`** ([wave engineering](/techniques/wave-engineering) formalizes it)
+- Decision, not prose → **typed decision** ([typed decisions](/techniques/typed-decisions))
+- Specialist takes over → **handoff**
+
+## Where next
+
+- [Wave engineering](/techniques/wave-engineering) — bounded parallel waves with a verify gate
+- [Phase engineering](/techniques/phase-engineering) — deterministic phase pipelines
+- [Flows internals](/compose/flows) — every node type and its semantics

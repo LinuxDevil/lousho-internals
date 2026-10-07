@@ -1,0 +1,57 @@
+---
+title: "Wave engineering"
+description: "WAVES — bounded parallel worker waves with an aggregate, a verify gate, and gap-seeded extension — and how the waves example composes it."
+---
+
+## The pattern
+
+Wave engineering (community-named; formalized as **WAVES**: Workers · Aggregate · Verify · Extend · Stop) is parallelization with a feedback edge:
+
+1. **Workers** — N sub-agents work N slices in parallel, each in a clean context
+2. **Aggregate** — the lead merges wave outputs into one result
+3. **Verify** — a verifier agent checks the aggregate against the goal and emits a gap list
+4. **Extend** — if gaps exist and budget remains, the next wave's prompts are *seeded from the gaps*
+5. **Stop** — terminate on verify-pass or `maxWaves` — boundedness is the point
+
+`examples/waves/` implements it on plain `createAgent` + `task`-style fan-out — no flow needed, because the ordering is a property of the driver function, not the model.
+
+## Why it's built this way
+
+- **Workers accumulate, not replace.** Wave 2's aggregate *extends* wave 1's — an earlier version let the aggregate overwrite, silently dropping earlier coverage. The fix lives in `aggregate(aggregateSoFar, waveResults)`: new material appends. A verifier that only sees the latest wave would never notice the regression — accumulation must be structural.
+- **Verify is a separate agent, not a prompt line.** "Check your work" in the worker prompt is self-grading; a distinct verifier with only the goal + aggregate can't rationalize its own output.
+- **Gaps seed the next wave directly.** The verifier returns structured gaps (`output` schema), and `extend` maps gap → worker prompt — the feedback is data, not prose.
+- **`maxWaves` is the honest bound.** Open-ended "loop until perfect" has no termination argument; the wave count is the budget, and `limits`/`budget` still apply underneath.
+
+## How it composes
+
+```text
+wave 1 ──► worker('t1') ─┐
+         worker('t2') ──┼─► aggregate ─► verify ─► gaps=[] ? done
+         worker('t3') ──┘                    │
+                                            gaps=[g1,g2] & waves<max
+wave 2 ──► worker(g1) ───┐                   ▼
+         worker(g2) ─────┴─► aggregate(accumulate) ─► verify ─► …
+```
+
+Each worker is a fresh context ([isolation](/techniques/context-engineering)); the driver holds all state between waves — nothing persists across `createAgent` calls except what the driver passes.
+
+## Example
+
+```ts
+for (let wave = 0; wave < maxWaves; wave++) {
+  const tasks = wave === 0 ? initialTasks : gaps.map(g => `cover the missing piece: ${g}`);
+  const results = await Promise.all(tasks.map(t => worker.send(t)));
+  aggregate = await aggregator.send({ prior: aggregate, results });
+  const verdict = await verifier.send({ goal, aggregate }); // output: { pass, gaps[] }
+  if (verdict.object.pass) break;
+  gaps = verdict.object.gaps;
+}
+```
+
+The full runnable version is `examples/waves/` — offline-tested with `mockModel`, live-validated on OpenRouter (verifier found real gaps, extension waves seeded, stopped at `maxWaves`).
+
+## Where next
+
+- [Sub-agents](/compose/subagents) — the worker primitive and `BackgroundTasks`
+- [Structured output](/providers/structured-output) — how the verifier's `{pass, gaps}` is enforced
+- [Phase engineering](/techniques/phase-engineering) — the sibling pattern where ordering is the contract

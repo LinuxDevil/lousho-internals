@@ -14,9 +14,11 @@ The [user docs](https://lousho.com/introduction) teach using the SDK. This site 
 - **Composition** — sub-agents, handoffs, flows, skills, agent directories, `.claude/` projects.
 - **Interfaces** — server/routes, UI bindings, channels, triggers/schedules, ACP, auth, OAuth.
 - **Ship and distribute** — CLI, build targets, spec files, registry kits, `create-lousho-agent`.
+- **Techniques** — the prompting/context/agentic catalog mapped to internals: wave engineering, phase engineering, typed decisions.
 - **Design decisions** — ADR-style pages: durable-by-default, error codes, branded types, peer-dependency strategy, typed decisions, flow-vs-loop.
 - **Quality gates** — mock model, record/replay, evals, observability, docs pipeline, API report + fallow.
 - **Contribute** — adding a feature, code conventions, release process.
+- **Study guide** — per-subsystem concept checklist, full glossary, and a no-peeking self-check quiz.
 
 Every subsystem page ends with real `src/` file and symbol references so you can jump straight into the code.
 

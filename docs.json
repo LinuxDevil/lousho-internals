@@ -110,6 +110,18 @@
             ]
           },
           {
+            "group": "Techniques",
+            "pages": [
+              "techniques/overview",
+              "techniques/prompt-level",
+              "techniques/context-engineering",
+              "techniques/agentic-patterns",
+              "techniques/wave-engineering",
+              "techniques/phase-engineering",
+              "techniques/typed-decisions"
+            ]
+          },
+          {
             "group": "Interfaces",
             "pages": [
               "interfaces/server-and-routes",
@@ -159,6 +171,14 @@
               "contribute/adding-a-feature",
               "contribute/code-conventions",
               "contribute/release-process"
+            ]
+          },
+          {
+            "group": "Study guide",
+            "pages": [
+              "study-guide",
+              "glossary",
+              "self-check"
             ]
           }
         ]

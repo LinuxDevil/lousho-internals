@@ -1,0 +1,147 @@
+---
+title: "Self-check"
+description: "The no-peeking quiz: answer each question cold, then expand to verify. Miss one → back to the subsystem page."
+---
+
+Same material as the [study guide](/study-guide), minus the answers. Answer out loud first — the accordion only confirms.
+
+## The whole shape
+
+<AccordionGroup>
+  <Accordion title="What happens inside one executor step?">
+    `runStep`: abort/budget check → `state.steps++` → apply queued input → `generateOrSurfaceError` (prepare request, `onLLMRequest`/`preGenerate` hooks, provider call in a `chat` span, `onLLMResponse`/`postGenerate`) → record usage → output guardrails → push `assistantTurn` → if tool calls: checkpoint the turn, then `runBatch`. [Core](/core/execution-loop)
+  </Accordion>
+  <Accordion title="Why does the turn checkpoint happen before any tool runs?">
+    So a crash mid-batch resumes by *running the calls*, never by re-generating the model's turn — the assistant message is already committed. Results then append in model order (not completion order) so the next provider request is deterministic for replay/cassettes. [Core](/core/durable-execution)
+  </Accordion>
+  <Accordion title="Name the two control flows and the line between them.">
+    The model-driven `AgentExecutor` loop (open-ended, bounded) vs. the deterministic `FlowExecutor` graph (harness-owned order, model only fills `llmCall`s). Flows lack approvals/hooks/checkpointing — gated or durable work must go through the loop. [Design](/design/flow-vs-loop)
+  </Accordion>
+</AccordionGroup>
+
+## Execution core
+
+<AccordionGroup>
+  <Accordion title="Order the tool-call gate.">
+    `onToolCall` → parse + schema-validate → `preToolCall` hooks → permission rules → guardrails → tool's `needsApproval` → permission-mode verdict, applied last and never un-denying. [Core](/core/approvals)
+  </Accordion>
+  <Accordion title="What does 'ask' actually do to the run?">
+    `ApprovalGate` writes a durable approval, the run pauses with `finishReason: 'awaiting-approval'`; `resume()`/`resolveApproval` re-enters via `resumedHookCall`/`runApprovedToolCall` — surviving process restarts because the approval is stored state, not an in-memory wait. [Core](/core/approvals)
+  </Accordion>
+  <Accordion title="Why does the model never see the 'hint (docs)' suffix on an SDKError?">
+    Errors returned to the model are thrown with `appendHelp: false` — `message` stays clean; only user-facing errors append `[code] hint (docs/errors.md#anchor)`. [Design](/design/error-codes)
+  </Accordion>
+  <Accordion title="What survives a duplicated SDK copy in one process?">
+    Branded values: `Symbol.for` + `Symbol.hasInstance` via `instanceOfBranded` (SDKError, HookRegistry), `globalThis` `Symbol.for` slots (`lousho.providerInterceptor`), and `WeakSet`/`WeakMap` marks — not `instanceof` on the class. [Design](/design/branded-types)
+  </Accordion>
+</AccordionGroup>
+
+## Sessions and state
+
+<AccordionGroup>
+  <Accordion title="What's in the AgentStore contract?">
+    Four collections: `sessions`, `checkpoints`, `approvals`, `tokens` — implemented by `memoryStore`/`fileStore`/`SqliteStore`/`KVStore`. Approvals claim take-once (`wx` claim files, `resolved_at` transactions, KV get+delete). [State](/state/storage-stores)
+  </Accordion>
+  <Accordion title="Why are remember_/recall_ tools marked 'transient'?">
+    They bind per-run on `RunToolRegistry` (scope resolved from run context), so they must not leak into the agent's durable fingerprint or persisted tool surface. [State](/state/memory)
+  </Accordion>
+  <Accordion title="When does compaction fire, and what are its two stages?">
+    A `preGenerate` hook at 0.9 × context window: stage 1 replaces old tool output with `prune-tool-results` markers; stage 2 folds atomic assistant+results groups into a summary, spliced in place (`protectedTokens` ≈ 40k kept verbatim; rejected summaries fall back via `WeakSet`). [State](/state/compaction)
+  </Accordion>
+</AccordionGroup>
+
+## Providers
+
+<AccordionGroup>
+  <Accordion title="How does 'openai/gpt-4o-mini' resolve?">
+    `resolveProviderSpec` splits on the first slash → `PROVIDERS` entry (envKey, config field, peers, env default model) → lazy provider construction; `pi/` nests a second spec; `LOUSHO_MODEL` and `detectProviderFromEnv` cover env-only setups. [Providers](/providers/model-selection)
+  </Accordion>
+  <Accordion title="How does one tree support ai v4–v7 and zod 3/4?">
+    `aiSdkCompat` maps requests/parts/chunks/usage per major (detected by export sniffing via `aiMajorOf`), `zodCompat`/`v4Parameters` bridges zod; CI's peers matrix runs every pairing. [Providers](/providers/ai-sdk-compat)
+  </Accordion>
+  <Accordion title="Why isn't decide() a provider?">
+    `POST /v1/decisions` isn't chat-completions: no tools, no streaming, unreachable via OpenRouter; it returns probability distributions, not prose. It's a standalone typed client. [Providers](/providers/decisions)
+  </Accordion>
+  <Accordion title="How is output: schema enforced?">
+    `outputInstruction` + `outputResponseFormat` on every call → `validateOutput` (unfence → parse → `parseWithIssues`) → exactly one repair retry via `outputRepairMessage`; failure ends `output-invalid`. [Providers](/providers/structured-output)
+  </Accordion>
+</AccordionGroup>
+
+## Tools
+
+<AccordionGroup>
+  <Accordion title="How does workspace confinement work?">
+    Two layers: `normalizeWorkspacePath` lexical normalization, then `NodeWorkspace` realpath/symlink checks — a symlink pointing outside still resolves outside and is refused. [Tools](/tools/workspace-tools)
+  </Accordion>
+  <Accordion title="How do MCP tools get approval semantics?">
+    `loadMcpTools` namespaces `server__tool`, converts JSON Schema → zod, and maps server annotations to `McpApproval` (readOnlyHint → auto-allow, destructiveHint → ask); absent annotations default to ask. [Tools](/tools/mcp)
+  </Accordion>
+  <Accordion title="How does tool search survive a restart but reset on handoff?">
+    `visibleTools`/`loadedToolNames` are *transcript-derived* — the loaded set is recomputed from the transcript itself, so resume restores it and a handoff's fresh transcript unloads it. [Tools](/tools/tool-search)
+  </Accordion>
+  <Accordion title="What's the code-mode boundary?">
+    A QuickJS isolate: scripts run inside, tool calls marshal through `nestedToolCaller` as JSON round-trips with `parentToolCallId`, a pause becomes a `ScriptError` cause inside the script. [Tools](/tools/code-mode)
+  </Accordion>
+</AccordionGroup>
+
+## Composition
+
+<AccordionGroup>
+  <Accordion title="What does transfer_to_<name> actually execute?">
+    Nothing as a tool — a cleared handoff switches `state.switched` (the run's options) and the loop continues as the target agent; `activeAgentOf` markers pick the right agent on resume; `maxHandoffs` = 5. [Compose](/compose/handoffs)
+  </Accordion>
+  <Accordion title="Which flow node types run, and which are editor-only?">
+    Runtime: sequence, parallel, oneOf, forEach, llmCall, toolCall, setVariable, evaluator, return, end, throw. `loop` is `EditorShapeStep`-only — it hits `dispatchNode` and throws `LOUSHO_FLOW_INVALID`. [Compose](/compose/flows)
+  </Accordion>
+  <Accordion title="loadAgentDir vs claudeProject — the trust difference?">
+    `loadAgentDir` is a full runtime contract (receipt verification, `confineToolsToReceipt` ALS guards, fetch/env confinement for unattested dirs); `claudeProject()` reads `.claude/` as *data* (instructions, skills, agents, scratchpad) — no enforcement surface. [Compose](/compose/agent-directories)
+  </Accordion>
+</AccordionGroup>
+
+## Interfaces and ship
+
+<AccordionGroup>
+  <Accordion title="What's on routeHandler's table?">
+    `POST /chat` (SSE, `data:` frames + `event: done`), `GET /chat/:id`, approval resolve routes, `/oauth/callback`; `createRouteHandler` adds `basePath`/`auth`/`hookRoute` remap; 1 MB body cap. [Interfaces](/interfaces/server-and-routes)
+  </Accordion>
+  <Accordion title="How do channels verify inbound requests?">
+    Per-surface: Slack `checkSlackSignatureWeb`, Discord Ed25519, Teams `oidc()`, GitHub `X-Hub-Signature-256` + installation tokens, webhook `checkWebhookAuth` (hmac/bearer + replay window, constant-time). [Interfaces](/interfaces/channels)
+  </Accordion>
+  <Accordion title="What's the worker constraint and where's it enforced?">
+    No `node:` imports reachable from the `worker` export — the Cloudflare bundle refuses them; an import-graph test enforces it, esbuild shims the allowed list. [Ship](/ship/build-targets)
+  </Accordion>
+  <Accordion title="What does a registry receipt enforce at runtime?">
+    `verifyReceipt` attestation; `confineToolsToReceipt` wraps the kit's tools in an AsyncLocalStorage envelope — confined `fetch`, `process.env` proxy, `enforcedApproval`, sandbox confinement; unattested → always-ask. [Ship](/ship/registry-kits)
+  </Accordion>
+</AccordionGroup>
+
+## Quality and design
+
+<AccordionGroup>
+  <Accordion title="CI's gate order?">
+    tsc → typecheck:tests → lint → build → api:check → create-lousho-agent build → docs:verify-snippets → test:types → docs:llms:check → registry:check → test:coverage → agent-forge → fallow; peers + pack-smoke as sibling jobs. [Quality](/quality/api-report-and-fallow)
+  </Accordion>
+  <Accordion title="What does a cassette never store?">
+    `rawResponse` — cassettes keep whitelisted request fields + stream `chunks`/`delayMs`; fingerprints redact `SECRETS` and normalize volatile fields so zod3/zod4 produce identical fingerprints. [Quality](/quality/record-replay)
+  </Accordion>
+  <Accordion title="What are the six ADR-level decisions?">
+    Durable-by-default · error-code registry with appendHelp split · branded types for dual-copy safety · peer-dependency strategy (optional peers, lazy load) · typed decisions (decide() client, not provider) · flow-vs-loop duality. [Design](/design/durable-by-default)
+  </Accordion>
+</AccordionGroup>
+
+## Techniques
+
+<AccordionGroup>
+  <Accordion title="The three layers and the rule they encode?">
+    Prompt-level / context engineering / workflow patterns — and "instructions steer; machinery enforces": anything that must never happen lives in permissions/guardrails, not the prompt. [Techniques](/techniques/overview)
+  </Accordion>
+  <Accordion title="WAVES — the five letters?">
+    Workers (parallel slices) · Aggregate (accumulate, never replace) · Verify (separate agent, structured gaps) · Extend (gaps seed the next wave) · Stop (verify-pass or `maxWaves`). [Techniques](/techniques/wave-engineering)
+  </Accordion>
+  <Accordion title="Why does phase-pipeline unroll its retry ladder?">
+    No runtime `loop` node exists — `return`/`end` don't early-exit either — so retries are static `oneOf`-guarded sequences, and a `toolCall` proof gate (not model opinion) decides pass/fail. [Techniques](/techniques/phase-engineering)
+  </Accordion>
+  <Accordion title="What makes a decision 'typed'?">
+    `{action, confidence}` enforced by `output` schema validation — the confidence floor (`< 0.7 → human`) can only gate because the field is guaranteed numeric; `decide()` is the dedicated fast path on OpenAI. [Techniques](/techniques/typed-decisions)
+  </Accordion>
+</AccordionGroup>

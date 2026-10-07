@@ -1,0 +1,121 @@
+---
+title: "Glossary"
+description: "Every term in the codebase, one line each — the vocabulary the internals pages assume."
+---
+
+## Runs and lifecycle
+
+| Term | Meaning |
+|---|---|
+| Run | One `agent.send()`/`stream()`/`execute()` invocation, start to `finishReason` |
+| Turn | One user input + everything it causes (a session's unit; a run is the executor's unit) |
+| Step | One `provider.generate()` + the tool calls it requests |
+| `finishReason` | How a run ended: `stop`, `tool_calls`, `awaiting-approval`, `aborted`, `max-steps`, `budget-exceeded`, `guardrail`, `output-invalid`, `error` |
+| Checkpoint | A saved step/turn in the store — the unit resume rehydrates from |
+| `pendingToolCalls` | Unanswered tool calls at transcript end; a resume runs them *before* re-asking the model |
+| Steer | `run.steer()`/`enqueue` — inject input mid-loop; aborts the current model call and retries with it |
+| Checkpoint ring | Per-session history of checkpoints, capped (`DEFAULT_CHECKPOINT_HISTORY_LIMIT` = 50) |
+| `SessionAwaitingApprovalError` | Thrown when a paused run's session is re-entered without resolving |
+
+## Approvals and permissions
+
+| Term | Meaning |
+|---|---|
+| Permission mode | `default`/`acceptEdits`/`plan`/`bypassPermissions` — a verdict applied *after* all other gates, never un-denying |
+| `needsApproval` | Per-tool predicate deciding `ask` for a given call |
+| Approval store | Durable `approvals` in `AgentStore`; take-once claim so two processes can't both resolve |
+| `approvedArgs` | Args pinned at approval time (`stableStringify`) — the approved call can't drift before execution |
+| Guardrail | Input/output check that can `deny`/`trip` a run (`LOUSHO_GUARDRAIL_TRIPPED`) |
+| Hook | `preToolCall`/`postToolCall`/`preGenerate`/`onToolCall`/`onToolResult`/… interception points |
+| `principal` | The authenticated caller identity threaded into runs, tools, approvals, memory |
+
+## Tools
+
+| Term | Meaning |
+|---|---|
+| `defineTool` | The canonical tool factory (`input:` zod schema; not `parameters`) |
+| `toolEntries` | Flattens tool inputs (functions, registries, maps) into the registry, with duplicate rules |
+| `RunToolRegistry` | Per-run tool surface — memory/scratchpad tools bind here and are marked `transient` |
+| Hosted tool | Provider-side tools (`web_search`, `code_interpreter`, `file_search`) mapped per provider |
+| `deferLoading` / `toolSearch` | Tool definitions hidden until `tool_search` returns them; transcript-derived so resume keeps them |
+| Code mode | `run_code` executes a script in a QuickJS isolate; tool calls become host round-trips; JSON-only boundary |
+| `exclusive` | Code-mode flag: sub-tools only callable from inside `run_code` |
+
+## State and context
+
+| Term | Meaning |
+|---|---|
+| `AgentStore` | The durability contract: `sessions`/`checkpoints`/`approvals`/`tokens` — memory/file/sqlite/kv impls |
+| `AgentSession` | Multi-turn owner: transcript, `send`/`enqueue`/`steer`, `fork()`, pending-turn resume |
+| `fork()` | Branch a session — `transcriptSteps`/`forkTranscript`/`providerValidPrefix` decide what's valid to replay |
+| Memory slot | `defineMemory` scoped persistence → `remember_*`/`recall_*` tools |
+| Compaction | Two-stage context pruning: `prune-tool-results` markers → summarize, spliced in place at 0.9×window |
+| `protectedTokens` | Compaction floor (40k) — recent context kept verbatim |
+| Context assembly | `extendRunOptions` ordering: skills → subagents → toolSearch → codeMode → plan → output |
+| `projectInstructions` | AGENTS.md walk-up instructions merged into `agent.prompt` |
+
+## Providers and models
+
+| Term | Meaning |
+|---|---|
+| `LLMProvider` | The model contract: `generate`/`stream`; everything model-shaped hides behind it |
+| Provider spec | `'provider/model'` — first-slash split; `pi/` nests a second spec |
+| `AiSdkProvider` | Shared base adapting Vercel AI SDK models to `LLMProvider` |
+| `aiSdkCompat` | v4↔v6/v7 request/part/chunk/usage mapping; `aiMajorOf` sniffs exports, not package.json |
+| `withFallback`/`withRetry`/`resilientProvider` | Provider combinators — retry, failover, both |
+| `mockModel` | `/testing` scripted provider — turns as strings/objects/functions, `calls`, `assertExhausted` |
+| Cassette | Recorded provider traffic replayed in `*.replay.test.ts`; fingerprinted, secrets-scrubbed |
+| `output` schema | Structured output contract — instruction + response format + validate + one repair retry |
+| `decide()` | OpenAI Decisions API client: `predicate`/`choice`/`score`/`refusal`, not a provider |
+| `replaysReasoning` | Whether signed reasoning blocks are retained for the next request |
+
+## Composition
+
+| Term | Meaning |
+|---|---|
+| `task` | The sub-agent tool — a child run in a clean context, result returns to the parent |
+| `BackgroundTasks` | `agent_status`/`agent_await`/`agent_cancel` — maxConcurrent 3, `awaitBackgroundOnFinish` |
+| `remoteAgent()` | HTTP delegation to another Lousho server — remote approvals pause the parent |
+| `piAgent()` | Pi-runtime sub-agent — session-per-task |
+| Handoff | `transfer_to_<name>` — gated like a tool, executed as a switch of `state.options`; `maxHandoffs` 5 |
+| `activeAgentOf` | Marker deciding which agent resumes after a restart in a handoff chain |
+| `inputFilter` | Boundary filter — what the receiving agent sees of the transcript |
+| Flow | `FlowBuilder`/`FlowExecutor` deterministic graph — 11 runtime node types |
+| `EditorShapeStep` vs `RuntimeStep` | Editor nodes (`loop`, `condition`, `uiComponent`) the executor *doesn't* run vs. the total runtime set |
+| `evaluateSafeExpression` | Hand-written recursive-descent evaluator for `oneOf`/`evaluator` — no `eval`, value-bound vars |
+| `{{var}}` | Flat text interpolation (`\w+` — no dots); conditions use the expression grammar instead |
+| Skill | `SKILL.md` progressive disclosure — `load_skill` returns the body on demand |
+| Agent dir | `loadAgentDir()` — a directory that *is* the agent; `claudeProject()` the `.claude/` variant |
+
+## Interfaces and ship
+
+| Term | Meaning |
+|---|---|
+| `routeHandler` | HTTP surface: `POST /chat` SSE, `GET /chat/:id`, approvals, `/oauth/callback` |
+| `reduceAgentEvents` | The shared `AgentUIState` reducer behind React/Vue/Svelte bindings |
+| Channel | `defineChannel` inbound surface — Slack/Discord/Teams/GitHub/webhook signature verification |
+| Trigger/schedule | Webhook auth (hmac/bearer, replay window) + Vixie cron, no-overlap chained timers |
+| ACP | Agent Client Protocol — ndjson JSON-RPC for editors; `session/request_permission` reverse call |
+| `SealedTokenStore` | AES-256-GCM sealed OAuth tokens, `v1.iv.ct`, record-key AAD, multi-key rotation |
+| Deployment adapter | scaffold→build→describe lifecycle — node-server, docker, cloudflare-worker |
+| `agent.yaml`/`agent.json` | The spec format — `loadSpec` → `specToAgent` |
+| Registry kit | `lousho add` installable bundle; receipt attestation + `confineToolsToReceipt` ALS envelope |
+| Agent Forge | `apps/agent-forge` studio — E2E-tested SDK consumer |
+
+## Errors and brands
+
+| Term | Meaning |
+|---|---|
+| `SDKError` | The error class — `code`, `detail` vs `message`, `appendHelp` |
+| `LOUSHO_*` / `LOU-*` | Stable error codes (hint + docs link appended) / changelog design-decision tags |
+| Branded type | `Symbol.for` + `Symbol.hasInstance` — survives two copies of the SDK in one process |
+| `Symbol.for('lousho.*')` | `globalThis` slots (`providerInterceptor`, `RUN_EVENTS`, …) |
+
+## Techniques
+
+| Term | Meaning |
+|---|---|
+| WAVE / WAVES | Workers · Aggregate · Verify · Extend · Stop — bounded parallel waves, `examples/waves` |
+| Phase engineering | Deterministic `llmCall`/`toolCall`/`oneOf` phase pipeline, `examples/phase-pipeline` |
+| Typed decision | `{action, confidence}` schema output or `decide()` — branching on data, not prose |
+| Evaluator-optimizer | Draft → `llmCritique` → revise loop, `examples/evaluator-loop` |

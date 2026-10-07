@@ -1,0 +1,28 @@
+---
+title: "Techniques: overview"
+description: "The three layers every agent technique lives at — prompt, context, workflow — and which layer of the SDK implements each."
+---
+
+Every technique in the catalog sits at exactly one of three layers, and the layer decides what in `src/` implements it — and what to fix when a technique underperforms:
+
+| Layer | Question it answers | Lousho machinery |
+|---|---|---|
+| **Prompt-level** | What is one model call asked to do, and how is it phrased? | `instructions`/`prompt`, seeded session turns, `output` schemas |
+| **Context engineering** | What fills the context window — written, selected, compressed, isolated? | memory, skills, `toolSearch`, compaction, sub-agents, code mode |
+| **Workflow patterns** | How many calls, in what shape, with which gates? | the agent loop, flows, `task` fan-out, handoffs, `decide()` |
+
+The design stance: Lousho makes layers 2 and 3 real machinery, so layer 1 stays a thin sheet of instructions on top. "Always verify after editing" as a prompt is a suggestion; as a flow `oneOf` chain it's a guarantee.
+
+## Reading the section
+
+- [Prompt-level techniques](/techniques/prompt-level) — few-shot, CoT, ReAct, personas, delimiters… all reduce to instructions + message shape. The page's point is *what not to solve in the prompt*.
+- [Context engineering](/techniques/context-engineering) — the write/select/compress/isolate quadrants and the four internals pages behind them.
+- [Agentic patterns](/techniques/agentic-patterns) — the canonical five (chaining, routing, parallelization, orchestrator-workers, evaluator-optimizer) plus the autonomous loop and handoffs.
+- [Wave engineering](/techniques/wave-engineering) — bounded parallel waves with a verify gate (WAVES).
+- [Phase engineering](/techniques/phase-engineering) — deterministic spec→plan→implement→verify pipelines.
+- [Typed decisions](/techniques/typed-decisions) — `{action, confidence}` schema decisions and the `decide()` fast path.
+
+## The two rules of thumb the SDK encodes
+
+1. **Instructions steer; machinery enforces.** Anything that must *never* happen lives in permissions, guardrails and tools — a hostile tool result can't overwrite a `deny` rule ([permission modes](/core/permission-modes)).
+2. **Token-spending techniques are budgeted like any spend.** Self-consistency, trees and critiques multiply calls; `limits`/`budget` bounds them ([execution loop](/core/execution-loop)).

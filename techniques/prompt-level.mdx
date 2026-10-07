@@ -1,0 +1,57 @@
+---
+title: "Prompt-level techniques"
+description: "Every single-call technique — few-shot, CoT, personas, delimiters — and why they all reduce to instructions, seeded turns, and output schemas."
+---
+
+## How they work
+
+A prompt-level technique changes one thing: the text and message shape a single model call sees. In the SDK that's three injection points, all resolved during [context assembly](/state/context-assembly):
+
+- `createAgent({ instructions, prompt })` — the persistent ask
+- seeded `session.send()` turns — a scripted user/assistant exchange the real turn continues (few-shot without polluting `instructions`)
+- `output: schema` — the ask becomes a typed contract, enforced by [structured output](/providers/structured-output)
+
+## The catalog → the mechanism
+
+| Technique | Mechanism in Lousho |
+|---|---|
+| Zero-shot | Default: `instructions` only |
+| Few-shot | Example pairs in `instructions`, or seeded session turns |
+| Chain-of-thought | Instructions — but prefer `reasoning` effort; signed reasoning tokens are cleaner than prompted monologue ([reasoning](/providers/reasoning)) |
+| Reflexion-lite | Instructions alone only critique *within* one call — real retry needs the [evaluator pattern](/techniques/agentic-patterns) |
+| Least-to-most | Ordered steps in `instructions`, or a `flows` sequence when order must hold |
+| Self-ask / generated knowledge | First `llmCall` writes a variable, second prompt interpolates it |
+| Meta-prompting | `llmCall` emits the next step's prompt text into a variable |
+| Persona | `instructions` — scope and tone only; personas don't add knowledge |
+| Negative / constrained | Style in instructions; *enforcement* in guardrails and permissions — never the prompt |
+| Delimiters / trust hierarchy | Quote tool results in instructions; the real boundary is `principal` + permission rules |
+| Scratchpad | A memory slot, a workspace file, or `.claude/scratchpad/` via `claudeProject()` |
+| Structured output | `output: zodSchema` — validated, typed, one repair retry |
+
+## Design decisions
+
+- **Prompted monologue is deprecated internally.** Chain-of-thought via instructions produces untraceable text; the `reasoning` option produces provider-native thinking blocks that are signed, retained across turns (`replaysReasoning`), and rendered as `reasoning` events.
+- **Self-consistency / tree-of-thoughts are not prompt techniques here.** Sampling N answers or exploring branches is a *workflow* — `parallel` flow nodes or `task` fan-out ([wave engineering](/techniques/wave-engineering)) — because the machinery (concurrency, aggregation) already exists.
+- **Enforcement never lives in the prompt.** "Never delete files" as text survives until a tool result talks the model out of it; `permissions: { rules: [...] }` survives forever.
+
+## Example
+
+```ts
+const agent = createAgent({
+  provider,
+  instructions: [
+    'You are a terse senior reviewer.',                       // persona
+    '## Examples',                                            // few-shot
+    'BAD: `var x = getData()` → name it for what it holds',
+    '## Rules',
+    'Never suggest deleting tests. Quote code in backticks.', // constraints
+  ].join('\n'),
+  output: z.object({ issues: z.array(z.string()), verdict: z.enum(['ship', 'fix']) }),
+});
+```
+
+## Where next
+
+- [Context assembly](/state/context-assembly) — where `instructions` lands in the request
+- [Structured output](/providers/structured-output) — the `output` enforcement path
+- [Agentic patterns](/techniques/agentic-patterns) — the layer above
