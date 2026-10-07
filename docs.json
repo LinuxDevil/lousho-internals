@@ -175,6 +175,7 @@
             "pages": [
               "contribute/adding-a-feature",
               "contribute/code-conventions",
+              "contribute/writing-docs",
               "contribute/release-process"
             ]
           },

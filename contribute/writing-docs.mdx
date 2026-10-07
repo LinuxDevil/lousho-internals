@@ -1,0 +1,66 @@
+---
+title: "Writing internals docs"
+description: "The authoring contract every internals page follows — beginner-first structure, diagram rules, and the page skeleton."
+---
+
+## Audience
+
+A contributor who has **never seen this codebase** and may have never seen the domain. They can read TypeScript. They do not know what a checkpoint, a turn, or a `RunToolRegistry` is until the page tells them. Write for that reader — the expert skims anyway; the beginner is the one who quits.
+
+## The page skeleton
+
+Every subsystem page follows this order — concept before mechanics, mechanics before code:
+
+```mdx
+---
+title: "<plain short name>"
+description: "<what it does + why it exists, one sentence>"
+---
+
+## What this is
+2-4 sentences in plain words. What it does for the SDK, plus one
+familiar analogy. No jargon that isn't defined inline or linked.
+
+## The mental model
+A mermaid diagram + the 3-6 nouns the reader must hold.
+("Three things exist: the gate, the store, the resume path.")
+
+## How it works
+A numbered walkthrough that literally follows the diagram's arrows.
+Each step names the real function or file it maps to.
+
+## Under the hood
+The deep internals: orderings, invariants, failure modes. This is
+where the verified technical density lives.
+
+## In code
+| Symbol | File | Role | — the entry-point table.
+
+## Example
+A real API snippet, narrated line by line.
+
+## Design decisions
+Bullets: what was chosen, what was rejected, what it costs.
+
+## Where next
+Links to the neighbouring pages a reader wants next.
+```
+
+Design-decision pages keep the tech-design template (Entry Point → Background → Goal → Scope → Solution → Other Solutions → Challenges → Implementation considerations) but put a `## The picture` mermaid diagram inside Solution and keep prose in plain sentences.
+
+## Diagram rules
+
+- Use ` ```mermaid ` fences — Mintlify renders them natively.
+- `flowchart LR` or `flowchart TD` for structure, `sequenceDiagram` for lifecycles. Pick the one that matches the story.
+- **≤ 10 nodes**, short labels (`Permission gate`, not `checkPermission() applies rule predicates`), quote labels containing `()`/`:`/`/`.
+- The diagram must match the numbered walkthrough below it — a reader should be able to point at an arrow and find its paragraph.
+- No ASCII-art walls. If a diagram needs >10 nodes, split the story into two diagrams.
+
+## Voice rules
+
+- Lead with the answer — the first sentence of every section says the thing, then explains it.
+- One idea per paragraph; prefer tables over prose enumerations; keep lists under ~8 items.
+- First use of an SDK term → link to its internals page or [the glossary](/glossary). First use of a general term → define it in plain words.
+- Examples are narrated: say what each block does, not just what it is.
+- Mark inference honestly: *(inferred)* when a rationale isn't recorded in code.
+- No emojis, no marketing voice, no "Note that", no filler.

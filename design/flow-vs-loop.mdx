@@ -11,7 +11,7 @@ Two executors: `AgentExecutor` (`src/execution/AgentExecutor.ts`) — the model-
 
 ## Rationale
 
-Two different jobs need sequencing: "let the model improvise within bounds" (open-ended tool work) and "the order is the contract" (phase pipelines, routing, fan-out). One mechanism can't serve both — a loop can't guarantee ordering, and a deterministic graph can't improvise.
+Two different jobs need sequencing: "let the model improvise within bounds" (open-ended tool work) and "the order is the contract" (phase pipelines, routing, fan-out). Think of it as taxi versus train: the agent loop is a driver who picks each turn as they go; a flow is a rail line — the track is fixed, and the model only fills the cars (`llmCall` nodes). One mechanism can't serve both — a loop can't guarantee ordering, and a deterministic graph can't improvise.
 
 ## Problem Statement
 
@@ -37,6 +37,7 @@ Two composable control flows: `AgentExecutor` for model-driven turns bounded by 
 ## This project is for
 
 - The `RuntimeStep` set: `sequence`, `parallel`, `oneOf`, `forEach`, `llmCall`, `toolCall`, `setVariable`, `evaluator`, `return`, `end`, `throw` — 11 node types with total handlers.
+- Flow definitions as plain data — a serializable step tree a visual editor or registry can produce, never executable code.
 
 ## This project is not for
 
@@ -46,6 +47,23 @@ Two composable control flows: `AgentExecutor` for model-driven turns bounded by 
 # Solution
 
 `FlowExecutor` is static and instance-free: a per-type handler map dispatches nodes, emitting `step-start`/`step-complete`/`step-error` events and OTel `flow.node`/`chat`/`execute_tool` spans; tool calls route through `executeToolWithSandboxGuard`. Two deliberately different interpolation regimes: prompts/tool args use flat `{{var}}` substitution (regex `\{\{(\w+)\}\}`, `toString()`, missing → `''` — dumb and predictable because output is model input); `oneOf`/`evaluator` conditions use `evaluateSafeExpression` — a recursive-descent evaluator, no host code, allowlists `includes`/`startsWith`/`endsWith`, binds `{{name}}` as *values* (a variable containing `x' === 'x' || 'a` is data, not injection). `return`/`end` resolve a value but don't early-exit — `executeSequence` runs every step; branching is expressed by `oneOf`, never by bailing.
+
+## The picture
+
+```mermaid
+flowchart TD
+    D["flow definition (plain data)"] --> E["FlowExecutor.dispatchNode: handler per node type"]
+    E --> S["sequence / parallel / forEach: order is fixed"]
+    E --> L["llmCall: the model improvises inside this node only"]
+    E --> O["oneOf: evaluateSafeExpression picks the branch"]
+    E --> T["toolCall: sandbox guard, no approvals or checkpoints"]
+    S --> N["next step"]
+    L --> N
+    O --> N
+    T --> N
+```
+
+Every node reduces to a value the next step consumes; `oneOf` is the only node that chooses between paths.
 
 # Other Solutions
 

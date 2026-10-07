@@ -3,44 +3,71 @@ title: "Channels"
 description: "How inbound surfaces (Slack, Discord, Teams, GitHub, Telegram, plain webhooks) are normalized into session turns: the Channel contract, channelCore's verify→parse→turn→reply pipeline, and mountChannels/mountFetchChannels."
 ---
 
-A **channel** adapts one inbound surface to the session API: it says how a request is authenticated (`verify`), which conversation it belongs to (`parse` → `sessionKey`), and how the reply or a pause goes back (`reply`, `onApproval`). All the shared machinery — serialization, pause bookkeeping, restart-safe decisions, error policy — lives in `channelCore.ts`; `mountChannels.ts` (node) and `fetchChannels.ts` (Workers) are transport plumbing over it.
+## What this is
 
-## Entry points
+A **channel** adapts one inbound surface — a Slack event, a Discord interaction, a signed webhook — to the session API, the way a power adapter lets one plug fit many sockets. It answers three questions: is this request really from that surface (`verify`), which conversation does it belong to (`parse` → `sessionKey`), and how does the reply or a pause go back (`reply`, `onApproval`). All shared machinery — serialization, pause bookkeeping, restart-safe decisions, error policy — lives in `channelCore.ts`; `mountChannels.ts` (Node) and `fetchChannels.ts` (Workers) are transport plumbing over it.
 
-| Symbol | File | Role |
-| --- | --- | --- |
-| `defineChannel(def)` | `src/channels/defineChannel.ts` | Validates `name` (`[A-Za-z0-9_-]{1,64}`) and returns the definition. Types: `Channel`, `ChannelRequest` (raw body bytes!), `ChannelInbound`, `ChannelDecision`, `ChannelContext`, `ChannelReplyContext`, `ChannelRespond`, `ChannelUser`. |
-| `channelCore(agent, channels, options)` | `src/channels/channelCore.ts` | The host-agnostic pipeline: `handle()` and `resolveApproval()`. No `node:*` import. |
-| `mountChannels(agent, channels, { store?, basePath?, onError?, onDecision? })` | `src/channels/mountChannels.ts` | `node:http` handler: `POST <basePath>/<name>` and `POST <basePath>/<name>/approvals/:id`; resolves `false` for non-routes. |
-| `mountFetchChannels(agent, channels, options)` | `src/channels/fetchChannels.ts` | Same routes on Fetch (`Request` → `Response | undefined`), with `ctx.waitUntil` keeping a turn alive past the ack. |
-| `channelSessionId(channel, inbound)`, `approvalPrompt(approval)`, `toChannelRequest(req, rawBody)` | `src/channels/defineChannel.ts` | Session id derivation (`<name>:<sessionKey>`, sanitized), default pause text, host-request adapter. |
-| `httpChannel`, `webhookChannel`, `slackChannel`, `discordChannel`, `telegramChannel`, `githubChannel`, `teamsChannel` | `src/channels/*Channel.ts` | The built-in surfaces. |
-| `createInstallationTokens({ appId, privateKey })` | `src/channels/githubAppAuth.ts` | Internal: GitHub App RS256 JWT → installation token, cached per installation until 5 min before expiry (Web Crypto only). |
-| `continueChannelSignIn(channels, result)` | `src/channels/channelCore.ts` | N9b: after `GET /oauth/callback` stores a token, continues the paused channel turn waiting on that sign-in. |
+## The mental model
+
+```mermaid
+sequenceDiagram
+    participant S as Surface
+    participant M as Mount
+    participant C as channelCore
+    participant Ch as Channel def
+    participant A as Agent session
+    S->>M: POST /channels/name
+    M->>C: handle(channel, req)
+    C->>Ch: verify(rawBody)
+    C->>Ch: parse → inbound
+    C->>A: session.stream(input)
+    A-->>C: result or pause
+    C->>Ch: reply / onApproval
+    Ch-->>S: answer
+```
+
+Hold four nouns: the **channel definition** (functions plus config, no state), **channelCore** (the pipeline and all the bookkeeping), the **mounts** (per-host HTTP plumbing), and the **session** (each conversation maps to `<channel>:<sessionKey>`).
 
 ## How it works
 
 `handle(channel, approvalId, req, respond)` runs one request:
 
-1. **verify** — `channel.verify(req)` returns `boolean` or `{ ok, reason? }`; `false` → `401 { error: 'Unauthorized' }`, and the `reason` is logged, never sent. `req.rawBody` is the exact bytes (`readRawBody`, 1 MB cap) because signatures are checked over them — never re-serialized JSON.
-2. **parse** — returns a `ChannelInbound` (`{ sessionKey, input, metadata?, principal?, replyTo, event? }`), a `ChannelDecision` (`{ decision, inbound?, approver? }` for a button click), or `null` (acknowledge without a turn — a bot echo, a Slack retry). `parse` gets `respond` (answer early, e.g. Slack's 3-second window) and a `ChannelContext` (`approval(id)`, `sessionId(sessionKey)`, `hasSession`, `pendingQuestion`) so the channel keeps no state of its own.
-3. **turn** — `channelSessionId()` maps to `agent.session({ id, store }).stream(input, { principal: inbound.principal, metadata: inbound.metadata })`. Turns of one session are serialized through a per-session promise tail (`serialized`).
-4. **reply** — `finish()` calls `channel.reply` with the result; a paused turn goes to `onApproval` (default: `reply` with `approvalPrompt` — the question, the sign-in link, or `Approve <tool> <args>? (approval id: ...)`), and the `{ channel, inbound, sessionId }` is stashed in `paused` keyed by approval id.
+1. **Verify** — `channel.verify(req)` returns `boolean` or `{ ok, reason? }`. `false` → `401 { error: 'Unauthorized' }`; the `reason` is logged, never sent. `req.rawBody` is the exact request bytes (`readRawBody`, 1 MB cap) because signatures are checked over them, not over re-serialized JSON.
+2. **Parse** — returns a `ChannelInbound` (`{ sessionKey, input, metadata?, principal?, replyTo, event? }`), a `ChannelDecision` (`{ decision, inbound?, approver? }` for a button click), or `null` — acknowledge without a turn (a bot echo, a Slack retry). `parse` gets `respond` (answer early — Slack demands an ack within ~3 seconds) and a `ChannelContext` (`approval(id)`, `sessionId(sessionKey)`, `hasSession`, `pendingQuestion`), so the channel keeps no state of its own.
+3. **Turn** — `channelSessionId()` maps the conversation to `agent.session({ id, store }).stream(input, { principal, metadata })`. Turns of one session are serialized through a per-session promise tail (`serialized`).
+4. **Reply** — `finish()` calls `channel.reply` with the result; a paused turn goes to `onApproval` (default: `reply` with `approvalPrompt` — the question, the sign-in link, or `Approve <tool> <args>? (approval id: …)`), and `{ channel, inbound, sessionId }` is stashed in `paused` keyed by approval id.
 
-A decision arrives two ways: `POST <base>/<name>/approvals/:id` (body `{ approved, note? }` or `{ answer }`) or a `ChannelDecision` from `parse` (a button click). `decide()` resolves the pause in the session's queue. If the clicking surface names its conversation (`decision.inbound`), the decision survives a restart: with checkpointed sessions `bindToSession` requires the session's pending turn to wait on exactly this approval of the matching kind (`answer` ↔ `question`), and `resume()` binds it via `SessionAwaitingApprovalError`. A click on the wrong conversation, a replayed id, or a sign-in pause is refused with `LOUSHO_APPROVAL_NOT_FOUND` (404 while the request is open).
+A decision arrives two ways: `POST <base>/<name>/approvals/:id` with `{ approved, note? }` or `{ answer }`, or a `ChannelDecision` from `parse` (a button click). `decide()` resolves the pause in the session's queue. If the clicking surface names its conversation (`decision.inbound`), the decision survives a restart: with checkpointed sessions `bindToSession` requires that conversation's pending turn to wait on exactly this approval, of the matching kind (`answer` ↔ `question`), and `resume()` binds it via `SessionAwaitingApprovalError`. A click on the wrong conversation, a replayed id, or a sign-in pause is refused with `LOUSHO_APPROVAL_NOT_FOUND` (404 while the request is open).
 
-Approvals carry identity both ways: `inbound.principal` is the verified sender as the **run's** principal (N10a), while `approver` — the clicking user — becomes the **decision's** principal (`{ id, type: 'user', authenticator: <channel name> }`), surfaced as `ctx.approval.by` and audited via `onDecision` (N10b). The run keeps its own principal; an approver never gains the starter's identity.
+## Under the hood
 
-Built-in verification per surface: `webhookChannel`/`httpChannel` use `checkWebhookAuth` (HMAC over raw body, bearer, custom — shared with `WebhookTriggerAdapter`); `slackChannel` uses `checkSlackSignatureWeb` (Web Crypto HMAC over `v0:{ts}:{body}`, 5-minute freshness window) and Block Kit Approve/Deny buttons whose value encodes the starter (`encodeApprovalRef`); `discordChannel` verifies Ed25519 interaction signatures; `teamsChannel` verifies the Bot Framework JWT with the auth module's `oidc()`/`verifyJwt` and pins `serviceurl` to the activity's `serviceUrl`; `githubChannel` checks `X-Hub-Signature-256` and takes `/approve <id>` comments; `telegramChannel` compares the `secret_token` header in constant time.
+Approvals carry identity both ways (N10a/N10b). `inbound.principal` — built only from data `verify` vouched for — is the **run's** principal. The `approver`, the clicking user, becomes the **decision's** principal (`{ id, type: 'user', authenticator: <channel name> }`), surfaced as `ctx.approval.by` and audited via `onDecision`. An approver never gains the starter's identity.
 
-## Design decisions
+Built-in verification, per surface:
 
-- **Channels own no state.** `paused` maps, session tails and `ChannelContext` live in `channelCore`; a channel definition is functions plus config. That is what makes `mountFetchChannels` a pure adapter and keeps channels testable without HTTP.
-- **The ack boundary defines the error policy.** `guard()` tracks whether `respond` was already called (`answered` WeakSet): a failure before the ack throws to the host (becomes a 500), a failure after goes to `onError` and best-effort `reply('Sorry, that request failed.')`. Surfaces like Slack must be answered within seconds, so "the turn failed" can no longer be an HTTP status.
-- **Sessions are derived, not stored.** `channelSessionId` = `<name>:<sessionKey>` (default), sanitized to `[A-Za-z0-9_-]` with a `cyrb53` suffix when needed — so `hasSession`/`pendingQuestion` can answer "was this thread already a session" from the store alone, and a restart doesn't lose the mapping.
-- **`principal` only from verified data.** `ChannelInbound.principal` is documented as "set it only from data `verify` vouched for" — a signed Slack payload can name `user.id`; an unsigned webhook cannot. `metadata` is explicitly unauthenticated.
-- **Pending questions are claimed once.** `pendingQuestion` hands out an `ask_question` id at most once (`claimed` set + session serialization), so two racing messages can't both answer the same question.
-- **Deprecated trigger adapters delegate here.** `WebhookTriggerAdapter` reuses `webhookChannel()` for auth and parsing — one HMAC/bearer implementation, one place to fix.
+| Channel | Check |
+| --- | --- |
+| `webhookChannel`, `httpChannel` | `checkWebhookAuth` — HMAC over the raw body, bearer, or custom. HMAC is a keyed hash: the sender proves it holds the shared secret. Shared with `WebhookTriggerAdapter`. |
+| `slackChannel` | `checkSlackSignatureWeb` — Web Crypto HMAC over `v0:{ts}:{body}` with a 5-minute freshness window; Block Kit Approve/Deny buttons encode the starter (`encodeApprovalRef`). |
+| `discordChannel` | Ed25519 interaction signatures — a public-key scheme: Discord signs `timestamp + rawBody`, the channel verifies with Discord's public key. |
+| `teamsChannel` | The Bot Framework JWT via the auth module's `oidc()`/`verifyJwt`, with `serviceurl` pinned to the activity's `serviceUrl`. |
+| `githubChannel` | `X-Hub-Signature-256`; `/approve <id>` comments. |
+| `telegramChannel` | The `secret_token` header, compared in constant time. |
+
+Other invariants: the ack boundary defines the error policy — `guard()` tracks whether `respond` fired (`answered` WeakSet), so a failure before the ack throws to the host (→ 500) while one after goes to `onError` plus a best-effort `reply('Sorry, that request failed.')`. Session ids are derived (`<name>:<sessionKey>`, sanitized to `[A-Za-z0-9_-]` with a `cyrb53` hash suffix when needed), so `hasSession`/`pendingQuestion` work from the store alone. `pendingQuestion` hands out an `ask_question` id at most once (`claimed` set + session serialization). `continueChannelSignIn` (N9b) continues a turn paused on sign-in after `GET /oauth/callback` stores the token.
+
+## In code
+
+| Symbol | File | Role |
+| --- | --- | --- |
+| `defineChannel(def)` | `src/channels/defineChannel.ts` | Validates `name` (`[A-Za-z0-9_-]{1,64}`); types `Channel`, `ChannelRequest`, `ChannelInbound`, `ChannelDecision`, `ChannelContext`. |
+| `channelCore(agent, channels, options)` | `src/channels/channelCore.ts` | The host-agnostic pipeline: `handle()` and `resolveApproval()`. No `node:*` import. |
+| `mountChannels(agent, channels, { store?, basePath?, onError?, onDecision? })` | `src/channels/mountChannels.ts` | `node:http`: `POST <basePath>/<name>` and `POST <basePath>/<name>/approvals/:id`; resolves `false` for non-routes. |
+| `mountFetchChannels` | `src/channels/fetchChannels.ts` | Same routes on Fetch, with `ctx.waitUntil` keeping a turn alive past the ack. |
+| `channelSessionId`, `approvalPrompt`, `toChannelRequest` | `src/channels/defineChannel.ts` | Session id derivation, default pause text, host-request adapter. |
+| `httpChannel`, `webhookChannel`, `slackChannel`, `discordChannel`, `telegramChannel`, `githubChannel`, `teamsChannel` | `src/channels/*Channel.ts` | The built-in surfaces. |
+| `createInstallationTokens` | `src/channels/githubAppAuth.ts` | GitHub App RS256 JWT → installation token, cached per installation until 5 min before expiry (Web Crypto only). |
+| `continueChannelSignIn` | `src/channels/channelCore.ts` | After the OAuth callback stores a token, continues the paused channel turn. |
 
 ## Example
 
@@ -62,10 +89,21 @@ const channels = mountChannels(agent, [
 ], { store, onDecision: ({ decision, approver, channel }) => audit(decision, approver, channel) });
 
 http.createServer((req, res) => void channels(req, res).then((ok) => ok || res.writeHead(404).end())).listen(3000);
-// POST /channels/slack            — events + button clicks
-// POST /channels/webhook          — HMAC-signed hooks, one-shot sessions (or body's sessionKey)
+// POST /channels/slack              — events + button clicks
+// POST /channels/webhook            — HMAC-signed hooks, one-shot sessions (or body's sessionKey)
 // POST /channels/slack/approvals/<id> — out-of-band decision
 ```
+
+`mountChannels` returns a handler that resolves `false` for non-channel paths, so it composes inside a bigger `node:http` server. `onDecision` is the audit hook — it fires when a button click names who decided.
+
+## Design decisions
+
+- **Channels own no state.** `paused` maps, session tails and `ChannelContext` live in `channelCore`; a channel definition is functions plus config. That is what makes `mountFetchChannels` a pure adapter and keeps channels testable without HTTP.
+- **The ack boundary defines the error policy.** Surfaces like Slack must be answered within seconds, so once the ack is sent "the turn failed" can no longer be an HTTP status — it becomes `onError` plus a failure reply.
+- **Sessions are derived, not stored.** `<name>:<sessionKey>` means a restart doesn't lose the mapping, and `hasSession` answers "was this thread already a session" from the store alone.
+- **`principal` only from verified data.** `ChannelInbound.principal` is documented as "set it only from data `verify` vouched for" — a signed Slack payload can name `user.id`; an unsigned webhook cannot. `metadata` is explicitly unauthenticated.
+- **Pending questions are claimed once.** Two racing messages cannot both answer the same question.
+- **Deprecated trigger adapters delegate here.** `WebhookTriggerAdapter` reuses `webhookChannel()` for auth and parsing — one HMAC/bearer implementation, one place to fix.
 
 ## Where next
 

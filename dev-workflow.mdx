@@ -3,6 +3,23 @@ title: "Dev workflow"
 description: "Clone to green: the local gate loop, test tiers, and what CI runs on every PR."
 ---
 
+## What this is
+
+The repo is protected by a pipeline of checks — some fast (lint, typecheck), some structural (API surface drift, docs snippet verification), some slow (pack-smoke, full coverage). Running them locally in the same order CI does means you fail fast, close to the change. Think of it as a set of increasingly expensive bouncers: talk to the cheap ones at the door before the expensive ones inside.
+
+## The mental model
+
+```mermaid
+flowchart LR
+    E[edit] --> F["fast gates<br/>lint · typecheck · unit tests"]
+    F --> D["docs gates<br/>snippets · llms.txt"]
+    D --> A["surface gates<br/>api:check · registry · fallow"]
+    A --> S["slow gates<br/>pack-smoke · coverage"]
+    S --> PR["green PR"]
+```
+
+## Setup
+
 ```bash
 git clone https://github.com/LinuxDevil/agent-sdk.git
 cd agent-sdk
@@ -26,9 +43,17 @@ CI runs these in order; run them locally in the same order to fail fast:
 | `npm run fallow` | Dead code, duplication, complexity/CRAP gates |
 | `npm run pack-smoke` | npm pack → install → ESM/CJS import → CLI smoke |
 
-The last two pack steps are slow; everything before them takes under a minute.
+The last two are slow; everything before them takes under a minute.
 
 ## Test tiers
+
+```mermaid
+flowchart TD
+    U["unit/contract — vitest, offline, always"] --> R["replay — *.replay.test.ts, recorded cassettes"]
+    R --> T["type — *.test-d.ts, asserts the public typing surface"]
+    T --> L["live — npm run test:live, real providers, needs keys"]
+    L --> C["coverage — npm run test:coverage, feeds fallow CRAP"]
+```
 
 - **Unit/contract** — `vitest run`; deterministic, no keys needed.
 - **Replay** — `*.replay.test.ts` replays recorded provider cassettes.
@@ -38,11 +63,13 @@ The last two pack steps are slow; everything before them takes under a minute.
 
 ## Changing code that ships
 
-1. Write/adjust a failing test (suite conventions live next to the code).
-2. Implement; keep the run loop and store contracts intact.
-3. Public API change? → `npm run api:update`, and docs snippet if user-facing.
-4. Doc change? → snippets are verified; ` ```ts ` blocks must typecheck standalone (`no-run`/`no-verify` fences exist for fragments that still should typecheck vs. be skipped).
-5. `npm run docs:llms` if any user-facing doc or README changed.
-6. Changelog under `## [Unreleased]`.
+<Steps>
+  <Step title="Write a failing test">Suite conventions live next to the code (`*.test.ts` colocated).</Step>
+  <Step title="Implement">Keep the run loop and store contracts intact.</Step>
+  <Step title="Public API change?">`npm run api:update`, eyeball the diff, and check docs snippets if user-facing.</Step>
+  <Step title="Doc change?">Every ` ```ts ` block must typecheck standalone; `no-run`/`no-verify` fences exist for fragments.</Step>
+  <Step title="Regenerate">`npm run docs:llms` if any user-facing doc or README changed.</Step>
+  <Step title="Changelog">Entry under `## [Unreleased]`.</Step>
+</Steps>
 
 See [adding a feature](/contribute/adding-a-feature) for the full checklist.

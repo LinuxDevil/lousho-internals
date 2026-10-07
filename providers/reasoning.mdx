@@ -3,42 +3,61 @@ title: "Reasoning: request to replayed block"
 description: "How the `reasoning` option maps to each provider's wire shape, how reasoning chunks flow through streams into events and results, and which blocks are kept on the transcript (Anthropic signed thinking)."
 ---
 
-`reasoning` (LOU-V13) is one option — `'none'|'minimal'|'low'|'medium'|'high'` or `{ effort?, budgetTokens?, summary?, force? }` — that each provider translates into its own API, and a second half that carries the model's reasoning back: stream chunks → `reasoning.*` events → `result.reasoning`, plus signed blocks kept on assistant tool-call turns for providers that require them back.
+## What this is
 
-## Entry points
+Many models can "think" before answering — OpenAI's o-series, Anthropic's extended thinking, DeepSeek-R1 — but every vendor spells the feature differently. `reasoning` (LOU-V13) is one SDK option — `'none'|'minimal'|'low'|'medium'|'high'` or `{ effort?, budgetTokens?, summary?, force? }` — that each provider translates into its own API.
 
-- `ReasoningOption` / `ReasoningEffort` / `ReasoningSettings` — `src/providers/reasoning.ts`; surfaced as `createAgent({ reasoning })`, `send(input, { reasoning })`, `ExecuteOptions.reasoning`, `GenerateOptions.reasoning`.
-- `reasoningProviderOptions(provider, modelId, option)` — the `providerOptions` for OpenAI/Anthropic/Ollama (same field on `ai` 4.3 and 6/7).
-- `openRouterReasoning(modelId, option)` — OpenRouter's unified `reasoning` body field (`{ max_tokens }` with a budget, else `{ effort }`), merged into the request body by `OpenRouterProvider`'s `withRequestChanges` fetch.
-- Pi: `reasoningOptions()` in `PiProvider` — effort is a pi `ThinkingLevel`, `budgetTokens` a `thinkingBudgets` entry, gated on the catalog's `reasoning` flag.
-- `ReasoningBlock` (`{ text, signature?, redactedData? }`) — `llm.ts`: on `GenerateResult.reasoning`, `StreamChunk.reasoning`, and `Message.reasoning`.
-- `streamStep.ts` — `CHUNK_HANDLERS` + `reportReasoning()`: chunks → `reasoning.start`/`.delta`/`.done` events.
+The feature has a second half too: the model's reasoning comes *back* as stream chunks, becomes `reasoning.*` events and `result.reasoning`, and — for providers that require it — signed blocks are kept on the transcript so a tool-call turn can send them back. Think of it as the model's scratchpad: you can watch it, but it never becomes prose.
+
+## The mental model
+
+```mermaid
+flowchart LR
+    A["reasoning option"] --> B["resolveReasoning + REASONING_MODELS gate"]
+    B --> C["providerOptions / reasoning field"]
+    C --> D["model call"]
+    D --> E["reasoning-delta / reasoning-end chunks"]
+    E --> F["events + result.reasoning"]
+    E --> G["Message.reasoning: signed blocks only"]
+```
+
+Five nouns: the **option** (`ReasoningOption`), the **gate** (`REASONING_MODELS` — which families accept it), the **wire mapping** (`providerOptions` or pi `thinkingBudgets`), the **chunks** (`reasoning-delta`/`reasoning-end`), and the **replay** (signed blocks kept on `Message.reasoning`).
 
 ## How it works
 
-**Sending.** `resolveReasoning()` normalizes the option (`effort` default `'medium'`), then gates on `REASONING_MODELS` — per-provider regexes of families known to accept it (OpenAI `o1+`/`gpt-5+` minus `-chat`/`o1-mini`/`o1-preview`; Anthropic `claude-3-7`/`…-4+`; OpenRouter's union; Ollama `deepseek-r1`/`qwen3`/`gpt-oss`/`magistral`). `'none'`, an unknown provider, or an unmatched model sends nothing; `force: true` bypasses the gate. `PROVIDER_OPTIONS` then maps to `providerOptions.openai.reasoningEffort` (+ `reasoningSummary: 'auto'` for `summary`), `anthropic.thinking: { type: 'enabled', budgetTokens }` (`THINKING_BUDGETS` 1024/2048/8192/24576, floor 1024 = Anthropic's minimum), `ollama.think: true` (ignored with one warning on `ai` 4). The provider packages add the budget to `max_tokens` and drop `temperature`/`topP` themselves.
+1. `resolveReasoning()` (`src/providers/reasoning.ts`) normalizes the option (`effort` defaults to `'medium'`), then gates on `REASONING_MODELS` — per-provider regexes of families known to accept it. `'none'`, an unknown provider or an unmatched model sends nothing; `force: true` bypasses the gate.
+2. `PROVIDER_OPTIONS` maps to the wire: `providerOptions.openai.reasoningEffort` (+ `reasoningSummary: 'auto'` for `summary`), `anthropic.thinking: { type: 'enabled', budgetTokens }` (`THINKING_BUDGETS` 1024/2048/8192/24576, floored at 1024 — Anthropic's minimum), `ollama.think: true` (ignored with one warning on `ai` 4). OpenRouter instead sets its unified `reasoning` body field (`{ max_tokens }` with a budget, else `{ effort }`), merged by `OpenRouterProvider`'s `withRequestChanges` fetch. Pi maps effort to a `ThinkingLevel` and `budgetTokens` to `thinkingBudgets`, gated on the catalog's `reasoning` flag. The provider packages add the budget to `max_tokens` and drop `temperature`/`topP` themselves.
+3. Receiving: every wire shape converges on two `StreamChunk` types — `reasoning-delta` (text) and `reasoning-end` (`signature?`/`redactedData?`).
+4. `generateViaStream()` (`streamStep.ts`) accumulates deltas into `block`/`thought`, emits `reasoning.start` on the first delta and `reasoning.done` (with `tokens` from `finish.usage.reasoningTokens`) when text or a tool call arrives; `reportReasoning()` synthesizes the same events for a non-streamed `generate()`.
+5. `noteReasoning()` (`agentRunState.ts`) joins each step's blocks into `state.reasoning` → `result.reasoning`.
+6. `assistantTurn()` (`agentRunState.ts`) keeps on `Message.reasoning` **only blocks with `signature` or `redactedData`** — the replay path for providers that need thinking back on a continued tool-call turn.
 
-**Receiving — streams.** On `ai` 6/7, `reasoning-start`/`-delta`/`-end` parts map to `reasoning-delta`/`reasoning-end` chunks; the open block's `providerMetadata` (Anthropic sends the signature on a delta) is remembered in `ChunkState` and attached at `reasoning-end`. On `ai` 4, `reasoning` parts → deltas, `reasoning-signature`/`redacted-reasoning` → ends. On pi, `thinking_delta`/`thinking_end` events carry `thinkingSignature`/`redacted`. OpenRouter is the special case: the `ai` SDK drops `reasoning`/`reasoning_details`, so `OpenRouterProvider` clones and parses the response body itself (`parseResponseBody`) and injects the observed chunks just before `finish` — only when the SDK reported none.
+## Under the hood
 
-The wire shapes all converge on two chunk types:
+- **The gate regexes** (`REASONING_MODELS`): OpenAI `o1+`/`gpt-5+` minus `-chat`/`o1-mini`/`o1-preview`; Anthropic `claude-3-7`/`…-4+`; OpenRouter's union; Ollama `deepseek-r1`/`qwen3`/`gpt-oss`/`magistral` — checked against the provider packages' sources.
+- **Stream mapping per major.** On `ai` 6/7, `reasoning-start`/`-delta`/`-end` parts map to `reasoning-delta`/`reasoning-end` chunks; the open block's `providerMetadata` (Anthropic sends the signature on a delta) is remembered in `ChunkState` and attached at `reasoning-end`. On `ai` 4, `reasoning` parts → deltas, `reasoning-signature`/`redacted-reasoning` → ends. On pi, `thinking_delta`/`thinking_end` events carry `thinkingSignature`/`redacted`.
+- **OpenRouter is the special case.** The `ai` SDK drops `reasoning`/`reasoning_details`, so `OpenRouterProvider` clones and parses the response body itself (`parseResponseBody`) and injects the observed chunks just before `finish` — only when the SDK reported none.
 
 | `StreamChunk` | Carries | Produced from |
 |---|---|---|
 | `reasoning-delta` | `textDelta` | v4 `reasoning` part, v6/7 `reasoning-delta`, pi `thinking_delta`, OpenRouter `reasoning`/`reasoning_details` text |
-| `reasoning-end` | `reasoning?: { signature?`, `redactedData? }` | v4 `reasoning-signature`/`redacted-reasoning`, v6/7 `reasoning-end` (+ held `providerMetadata`), pi `thinking_end`, OpenRouter `reasoning.signature`/`.encrypted` |
+| `reasoning-end` | `reasoning?: { signature?, redactedData? }` | v4 `reasoning-signature`/`redacted-reasoning`, v6/7 `reasoning-end` (+ held `providerMetadata`), pi `thinking_end`, OpenRouter `reasoning.signature`/`.encrypted` |
 
-**Receiving — events and results.** `generateViaStream()` (`streamStep.ts`) accumulates deltas into `block`/`thought`, emits `reasoning.start` on the first delta and `reasoning.done` (with `tokens` from `finish.usage.reasoningTokens`) when text or a tool call arrives. `reportReasoning()` synthesizes the same start/delta/done for a non-streamed `generate()`. `noteReasoning()` joins each step's blocks into `state.reasoning` → `result.reasoning`; `usage.reasoningTokens` rides the normal usage path (`lousho.usage.reasoning_tokens` on the `chat` span).
+- **Replaying.** `AnthropicProvider.replaysReasoning = true` makes `toCoreMessages` emit kept blocks first in a tool-call turn (`toReasoningPart`); pi does the same via `reasoningToPi`. Anthropic requires the signed thinking back when a tool-call turn continues. Blocks survive checkpoints and resumes because they live on the saved message. Unsigned reasoning and the reasoning of a final reply are never kept in `messages`.
+- **One event surface for every consumer.** `reduceAgentEvents()` stores them on `UIMessage.reasoning`, `toUIMessageStream()` emits `reasoning-start`/`-delta`/`-end` parts for `useChat`, `lousho acp` sends `agent_thought_chunk`, `lousho chat` prints them dimmed, and `recordReplay` cassettes keep the chunks so replay reproduces them. `usage.reasoningTokens` rides the normal usage path (`lousho.usage.reasoning_tokens` on the `chat` span).
 
-**Replaying.** `assistantTurn()` (`agentRunState.ts`) keeps on `Message.reasoning` **only blocks with `signature` or `redactedData`** — Anthropic requires the signed thinking back when a tool-call turn continues. `AnthropicProvider.replaysReasoning = true` makes `toCoreMessages` emit them first in that turn (`toReasoningPart`); pi does the same via `reasoningToPi`. They survive checkpoints and resumes because they live on the saved message. Unsigned reasoning and the reasoning of a final reply are never kept in `messages`.
+## In code
 
-Downstream consumers all read the same events: `reduceAgentEvents()` stores them on `UIMessage.reasoning`, `toUIMessageStream()` emits `reasoning-start`/`-delta`/`-end` parts for `useChat`, `lousho acp` sends `agent_thought_chunk`, `lousho chat` prints them dimmed, and `recordReplay` cassettes keep the chunks so replay reproduces them.
-
-## Design decisions
-
-- **Known-family gate, `force` escape hatch.** Sending unknown options to a non-reasoning model fails the call; the regexes are checked against the provider packages' sources and `force` covers fine-tunes and new families.
-- **Reasoning is not transcript text.** It reports through events/results and `Message.reasoning` for the one provider that needs it back — never concatenated into `content`, so it can't leak into prompts or compaction as prose.
-- **Two acquisition paths, one chunk type.** Whether the SDK reports parts or OpenRouter's raw body is scraped, consumers see the same `reasoning-delta`/`reasoning-end` chunks — `result.reasoning`, ACP `agent_thought_chunk`, `lousho chat` dimming and cassettes all hang off that.
-- **`reasoning-done` tokens come from usage, not a block field** — token counts arrive at `finish`, after the last block closed.
+| Symbol | File | Role |
+|---|---|---|
+| `ReasoningOption` / `ReasoningSettings` | `src/providers/reasoning.ts` | The public option (`createAgent`, `send`, `ExecuteOptions`, `GenerateOptions`) |
+| `resolveReasoning()` / `REASONING_MODELS` | `src/providers/reasoning.ts` | Normalize + the known-family gate |
+| `reasoningProviderOptions()` | `src/providers/reasoning.ts` | `providerOptions` for OpenAI/Anthropic/Ollama (same field on `ai` 4.3 and 6/7) |
+| `openRouterReasoning()` | `src/providers/reasoning.ts` | OpenRouter's `reasoning` body field |
+| `reasoningOptions()` | `src/providers/pi/PiProvider.ts` | pi `ThinkingLevel` / `thinkingBudgets` |
+| `ReasoningBlock` | `src/providers/llm.ts` | `{ text, signature?, redactedData? }` on results, chunks and messages |
+| `CHUNK_HANDLERS` / `reportReasoning()` | `src/execution/streamStep.ts` | Chunks → `reasoning.start`/`.delta`/`.done` events |
+| `assistantTurn()` / `noteReasoning()` | `src/execution/agentRunState.ts` | Transcript replay + `result.reasoning` |
 
 ## Example
 
@@ -52,6 +71,18 @@ const result = await agent.send('Harder.', { reasoning: { effort: 'high', budget
 result.reasoning; // the run's reasoning text
 result.usage.reasoningTokens;
 ```
+
+The same option on a non-reasoning model is silently dropped by the gate — add `force: true` only when you know the model accepts reasoning settings.
+
+## Design decisions
+
+- **Known-family gate, `force` escape hatch.** Sending unknown options to a non-reasoning model fails the call; the regexes cover the families the provider packages document, and `force` covers fine-tunes and new families.
+- **Reasoning is not transcript text.** It reports through events/results and `Message.reasoning` for the one provider that needs it back — never concatenated into `content`, so it can't leak into prompts or compaction as prose.
+- **Two acquisition paths, one chunk type.** Whether the SDK reports parts or OpenRouter's raw body is scraped, consumers see the same `reasoning-delta`/`reasoning-end` chunks — `result.reasoning`, ACP `agent_thought_chunk`, `lousho chat` dimming and cassettes all hang off that.
+- **`reasoning-done` tokens come from usage, not a block field** — token counts arrive at `finish`, after the last block closed.
+- **Signed blocks replay, unsigned don't.** Anthropic's API requires the thinking signature back when a tool-call turn continues; keeping only signed blocks on `Message.reasoning` meets that requirement without growing every transcript with scratchpad text.
+
+Once both halves are in place — gated request, converged chunks — every consumer downstream (UI streams, ACP, cassettes, run results) reads reasoning the same way regardless of which provider produced it.
 
 ## Where next
 

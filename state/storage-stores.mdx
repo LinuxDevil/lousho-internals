@@ -3,24 +3,36 @@ title: "Storage and stores"
 description: "The AgentStore contract (sessions, checkpoints, approvals, tokens), the memoryStore/fileStore/SqliteStore/KVStore implementations, and why each storage shape exists."
 ---
 
-`createAgent({ store })` takes one `AgentStore` — four optional sub-stores — and wires sessions, durable-execution checkpoints, pending approvals and OAuth tokens from it. Every interface is deliberately small (`load`/`save`/`delete`, plus claim-on-read for approvals and an optional bounded `history()` for checkpoints), because the stores exist to make pause/resume a *data* problem: another process, or another week, can pick up where a run stopped.
+## What this is
 
-## Entry points
+`createAgent({ store })` takes one `AgentStore` and wires sessions, durable-execution checkpoints, pending approvals and OAuth tokens from it. Think of it like a filing cabinet with four drawers — each drawer is a small, optional sub-store, and you can swap the whole cabinet for an in-memory, file, SQLite, or KV version without changing anything else. The stores exist to make pause/resume a *data* problem: another process, or another week, can pick up where a run stopped.
 
-- `AgentStore`, `memoryStore()`, `MemoryStoreOptions`, `MemoryCheckpointStore` — `src/storage/agentStore.ts`.
-- `SessionStore`, `MemorySessionStore`, `FileSessionStore` — `src/session/sessionStore.ts`.
-- `CheckpointStore`, `Checkpoint`, `CheckpointHistoryEntry`, `LocalStorageCheckpointStore`, `appendToRing`/`newestFirst`/`resolveHistoryLimit`/`toHistoryEntry` — `src/execution/checkpoint.ts`.
-- `ApprovalStore` (`save(pending, snapshot)`, `resolve(id)`, `load(id)`), `InMemoryApprovalStore` — `src/execution/ApprovalGate.ts`, `src/execution/InMemoryApprovalStore.ts`.
-- `fileStore(dir)`, `FileStoreOptions` (+ internal `FileCheckpointStore`, `FileApprovalStore`, `FileTokenBackend`) — `src/storage/fileStore.ts`.
-- `SqliteStore`, `SqliteStoreOptions`, `prune()`; `SqliteSessionStore`/`SqliteCheckpointStore`/`SqliteApprovalStore`, `Statements` — `src/storage/sqlite/SqliteStore.ts`, `src/storage/sqlite/stores.ts`, `src/storage/sqlite/migrations.ts`.
-- `KVStore`, `KVStoreOptions`; `KVCheckpointStore`, `DEFAULT_KV_KEY_PREFIX` — `src/deploy/kvStore.ts`, `src/deploy/kvCheckpointStore.ts` (subpath `@lousho/build-ai-agent/kv`).
-- `StorageService`, `readJSONAttachmentLocked` — legacy `.lock`-file file I/O, `src/storage/StorageService.ts`.
+## The mental model
+
+```mermaid
+flowchart TD
+  agent["createAgent({ store })"] --> store["AgentStore — the contract"]
+  impl["memoryStore / fileStore / SqliteStore / KVStore"] -.-> store
+  store --> sessions["sessions — Message[] transcripts"]
+  store --> cps["checkpoints — Checkpoint + history ring"]
+  store --> appr["approvals — claim-once pause records"]
+  store --> tok["tokens — OAuth secrets"]
+```
+
+Three things exist: the **contract** (`AgentStore` — `{ sessions?, checkpoints?, approvals?, tokens? }`), the **sub-stores** (each a small `load`/`save`/`delete` interface), and the **implementations** (`memoryStore()`, `fileStore()`, `SqliteStore`, `KVStore`).
 
 ## How it works
 
-**The contract.** `AgentStore` is `{ sessions?, checkpoints?, approvals?, tokens? }` — each part optional and independently overridable (`withDefaultStores` merges per-call `store`/`checkpointStore`/`approvalStore` over the agent default). `sessions` holds `Message[]` transcripts; `checkpoints` holds `Checkpoint` blobs keyed by `sessionId` (session turns use `<id>.turn-<n>`); `approvals` holds `{ pending, snapshot }` records; `tokens` is an `OAuthTokenStore`, sealed with `tokenKey` in the file/SQLite/KV stores.
+1. **You pass one store to `createAgent`.** Every sub-store is optional and independently overridable — `withDefaultStores` merges per-call `store`/`checkpointStore`/`approvalStore` over the agent default.
+2. **`sessions` holds transcripts.** `SessionStore` persists `Message[]` per session id — see [sessions](/state/sessions).
+3. **`checkpoints` holds save points.** `Checkpoint` blobs keyed by `sessionId` (session turns use `<id>.turn-<n>`); a store with `history()` also appends every `save()` to a bounded per-session ring.
+4. **`approvals` holds pause records.** `ApprovalStore` saves `{ pending, snapshot }` and resolves take-once — whichever backend, exactly one caller may resume a paused run.
+5. **`tokens` holds OAuth secrets** as an `OAuthTokenStore`, sealed with `tokenKey` in the file/SQLite/KV stores.
+6. **You pick an implementation.** `memoryStore()` for tests, `fileStore(dir)` for zero-dependency durability, `SqliteStore` for multi-process, `KVStore` for Cloudflare Workers.
 
-**Checkpoint history (LOU-D43).** A store with `history()` also appends every `save()` to a bounded per-session ring (`historyLimit`, default `DEFAULT_CHECKPOINT_HISTORY_LIMIT` = 50, `0` disables); `delete()` clears it unless `{ keepHistory: true }`. This is what `AgentExecutor.fork()` replays from.
+## Under the hood
+
+**Checkpoint history (LOU-D43).** Stores with `history()` keep a bounded per-session ring (`historyLimit`, default `DEFAULT_CHECKPOINT_HISTORY_LIMIT` = 50, `0` disables); `delete()` clears it unless `{ keepHistory: true }`. This is what `AgentExecutor.fork()` replays from.
 
 **Byte encoding.** Multimodal parts (`Uint8Array`) round-trip through JSON as `{ "$bytes": "<base64>" }` via `encodeBytes`/`decodeBytes`, shared by `FileSessionStore`, `fileStore`, `SqliteStore` and `KVStore` (which reimplements it without `Buffer`).
 
@@ -32,13 +44,18 @@ description: "The AgentStore contract (sessions, checkpoints, approvals, tokens)
 
 **StorageService.** The older path: `.lock`-file locking and a 10 MB JSON cap behind `LocalStorageCheckpointStore` and `StorageServiceApprovalStore` (`@lousho/build-ai-agent/utils`). New code should prefer `fileStore()` — same JSON-on-disk durability without lock files.
 
-## Design decisions
+## In code
 
-- **Why JSON files vs SQLite vs KV.** `memoryStore()` is for tests and scripts (copies on save/load, dies with the process). `fileStore()` is the zero-dependency durable option for one Node process or a small deployment — human-inspectable, atomic writes, but the checkpoint-history ring is a read-modify-write so two processes can lose an entry. `SqliteStore` is the multi-process answer: transactions make approval claims and history truncation safe across writers, and `prune()` gives retention. `KVStore` is the only option on Workers; it accepts KV's ~60 s eventual consistency and non-atomic read-modify-write, so a session's requests should be routed to one location (e.g. a Durable Object) when double-writes matter.
-- **Approval `resolve` is take-once.** Whichever backend, exactly one caller may resume a paused run: `wx` claim files (file), a `resolved_at` transaction (SQLite), get+delete (KV). Duplicate human decisions can't double-resume a run.
-- **Opaque JSON payloads.** The stores never inspect `Checkpoint.messages` or snapshot internals — forward compatibility for free; the cost is no queries beyond key lookup, which nothing needs.
-- **`history()` is optional.** Simple stores stay minimal; `getCheckpointHistory()` returns `undefined` so callers can feature-detect fork/replay support.
-- **Interfaces over inheritance.** `SessionStore`/`CheckpointStore`/`ApprovalStore` are structural — a Postgres or Redis backend is a five-method class, not a fork of the SDK.
+| Symbol | File | Role |
+|---|---|---|
+| `AgentStore`, `memoryStore()`, `MemoryStoreOptions`, `MemoryCheckpointStore` | `src/storage/agentStore.ts` | the contract and the in-memory implementation |
+| `SessionStore`, `MemorySessionStore`, `FileSessionStore` | `src/session/sessionStore.ts` | transcript persistence (+ `encodeBytes`/`decodeBytes`) |
+| `CheckpointStore`, `Checkpoint`, `CheckpointHistoryEntry`, `LocalStorageCheckpointStore`, `appendToRing`/`newestFirst`/`resolveHistoryLimit`/`toHistoryEntry` | `src/execution/checkpoint.ts` | checkpoint shape, contract, and history-ring helpers |
+| `ApprovalStore`, `InMemoryApprovalStore` | `src/execution/ApprovalGate.ts`, `src/execution/InMemoryApprovalStore.ts` | `save(pending, snapshot)`, `resolve(id)`, `load(id)` |
+| `fileStore(dir)`, `FileStoreOptions` (+ internal `FileCheckpointStore`, `FileApprovalStore`, `FileTokenBackend`) | `src/storage/fileStore.ts` | JSON-file implementation |
+| `SqliteStore`, `SqliteStoreOptions`, `prune()`; `SqliteSessionStore`/`SqliteCheckpointStore`/`SqliteApprovalStore`, `Statements` | `src/storage/sqlite/SqliteStore.ts`, `src/storage/sqlite/stores.ts`, `src/storage/sqlite/migrations.ts` | `node:sqlite` implementation |
+| `KVStore`, `KVStoreOptions`; `KVCheckpointStore`, `DEFAULT_KV_KEY_PREFIX` | `src/deploy/kvStore.ts`, `src/deploy/kvCheckpointStore.ts` | Workers implementation (subpath `@lousho/build-ai-agent/kv`) |
+| `StorageService`, `readJSONAttachmentLocked` | `src/storage/StorageService.ts` | legacy `.lock`-file file I/O |
 
 ## Example
 
@@ -55,6 +72,16 @@ await AgentExecutor.execute({ agent, input, provider, sessionId: 'job-1', checkp
 store.prune({ olderThanMs: 7 * 24 * 60 * 60 * 1000 }); // { sessions, checkpoints, approvals, oauthPending }
 store.close();
 ```
+
+The agent's default store is `fileStore('./.lousho')`, so anything without an override lands as JSON files on disk. The session is given a `SqliteStore` — it stores its transcript in `store.sessions` and its turn checkpoints in `store.checkpoints`, both inside `agent.db`. Passing `store.checkpoints` straight into `AgentExecutor.execute` makes a standalone (non-session) run durable under the key `job-1`. `prune()` sweeps records older than a week, and `close()` releases the database file.
+
+## Design decisions
+
+- **Why JSON files vs SQLite vs KV.** `memoryStore()` is for tests and scripts (copies on save/load, dies with the process). `fileStore()` is the zero-dependency durable option for one Node process or a small deployment — human-inspectable, atomic writes, but the checkpoint-history ring is a read-modify-write so two processes can lose an entry. `SqliteStore` is the multi-process answer: transactions make approval claims and history truncation safe across writers, and `prune()` gives retention. `KVStore` is the only option on Workers; it accepts KV's ~60 s eventual consistency and non-atomic read-modify-write, so a session's requests should be routed to one location (e.g. a Durable Object) when double-writes matter.
+- **Approval `resolve` is take-once.** Whichever backend, exactly one caller may resume a paused run: `wx` claim files (file), a `resolved_at` transaction (SQLite), get+delete (KV). Duplicate human decisions can't double-resume a run.
+- **Opaque JSON payloads.** The stores never inspect `Checkpoint.messages` or snapshot internals — forward compatibility for free; the cost is no queries beyond key lookup, which nothing needs.
+- **`history()` is optional.** Simple stores stay minimal; `getCheckpointHistory()` returns `undefined` so callers can feature-detect fork/replay support.
+- **Interfaces over inheritance.** `SessionStore`/`CheckpointStore`/`ApprovalStore` are structural — a Postgres or Redis backend is a five-method class, not a fork of the SDK.
 
 ## Where next
 

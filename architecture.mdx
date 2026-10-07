@@ -3,31 +3,53 @@ title: "Architecture"
 description: "The end-to-end shape of the SDK: one execution loop, pluggable providers, durable stores, and every surface that hangs off it."
 ---
 
-`createAgent()` compiles an `AgentConfig` (model, instructions, tools, permissions, stores, hooks) into an agent runtime. A run is a loop: the model emits text or tool calls; tool calls pass the permission gate, hooks, and approval gate; results feed back; the loop ends on text-only finish, approval pause, budget, abort, or error.
+## What this is
 
-## The run loop
+Lousho is a library, not a service: `createAgent()` compiles an `AgentConfig` (model, instructions, tools, permissions, stores, hooks) into a runtime, and a *run* is one loop — the model emits text or tool calls, tools execute behind a safety gate, results feed back, and everything is checkpointed and emitted as events. Think of it as a **conveyor belt with a brake and a save button**: work moves around the loop automatically, a human can stop it at any tool call, and the whole belt can be powered off and restarted from the exact same spot.
 
-```text
-agent.send(input)
-  └─► AgentExecutor (src/execution/AgentExecutor.ts)
-        ├─ assemble context: instructions + projectInstructions + memory recall + transcript
-        ├─ provider.generate(...)            model turn (text | tool calls)
-        ├─ for each tool call:
-        │     permissions rules ─► allow / deny / ask
-        │     hooks.preToolCall  ─► may veto / rewrite args
-        │     ask?               ─► ApprovalGate → durable store → PAUSE
-        │     tool.execute()     ─► zod-validated args
-        │     hooks.postToolCall ─► audit / annotate
-        │     checkpoint         ─► step committed to the store
-        ├─ next turn until finish / maxSteps / budget / abort
-        └─ events emitted on the versioned JSON stream the whole way
+## The mental model
+
+```mermaid
+flowchart LR
+    U([you]) -->|send / stream| EX[AgentExecutor]
+    subgraph LOOP["the run loop — src/execution"]
+        EX --> P[Provider]
+        P -->|"text or tool calls"| G["Safety gate<br/>rules · hooks · approval"]
+        G -->|cleared| T["ToolRegistry<br/>tools execute"]
+        G -->|"ask"| A[(Approval store)]
+        T -->|results| CK[(Checkpoint store)]
+        CK -->|loop| P
+    end
+    LOOP --> EV[["versioned event stream<br/>→ SSE · UI · traces"]]
+    A -.->|resolve → resume| EX
 ```
 
-Three properties fall out of this shape and explain most of the codebase:
+Six nouns to hold while reading every page after this one:
 
-- **Durability is structural, not optional.** Every step checkpoints into an `AgentStore` (memory / files / SQLite / Cloudflare KV). A paused approval is a stored fact, not an in-memory wait — so `agent.resume()` works from another request or another process. See [durable execution](/core/durable-execution).
-- **The model surface is swappable.** `model: 'openai/gpt-4o-mini'` resolves through the provider layer (`src/providers/`): Vercel AI SDK providers for OpenAI/Anthropic/OpenRouter/Ollama, `pi/<p>/<m>` for the Pi catalog, or an injected provider/`mockModel()` for tests. The loop only sees the shared generate/stream contract. See [provider architecture](/providers/architecture).
-- **Everything observable is an event.** Runs emit versioned JSON events (`agentEvents`) which feed SSE, the React/Vue/Svelte bindings, the session client and traces. There is no separate "what happened" channel. See [streaming events](/core/streaming-events).
+| Noun | One line |
+|---|---|
+| **Run** | One `agent.send()`/`stream()`/`execute()` — start to `finishReason` |
+| **Step** | One `provider.generate()` plus the tool calls it requests |
+| **Checkpoint** | A saved step in the store — resume replays from it |
+| **Gate** | The rules → hooks → `needsApproval` → permission-mode chain every tool call passes |
+| **Store** | The `AgentStore` bundle: sessions, checkpoints, approvals, tokens |
+| **Event stream** | The versioned JSON events every surface (SSE, UI, traces) reads |
+
+## How it works
+
+1. `agent.send(input)` enters `AgentExecutor.execute()` — everything needed is on `ExecuteOptions`; the executor is static and instance-free.
+2. `prepareGenerateRequest` builds the model call; the provider turns `'openai/gpt-4o-mini'`-style specs into a real model through the provider layer (Vercel AI SDK, pi, OpenRouter, Ollama — or `mockModel` in tests).
+3. The model replies with text or tool calls. Each tool call goes through the **gate**: permission rules → `preToolCall` hooks → the tool's own `needsApproval` → the permission-mode verdict — in that order, mode last and never un-denying.
+4. `ask` doesn't wait in memory — `ApprovalGate` writes a durable record and the run *pauses*. `resume()` (possibly days later, another process) re-enters where it left off.
+5. Cleared calls execute, results append in call order, and the turn + results are checkpointed — so a crash mid-batch resumes by *re-running the calls*, never by re-asking the model.
+6. The loop ends on a text-only reply (`stop`), a pause, `maxSteps`, budget, abort, or error — every moment emitted on the event stream.
+
+## The two control flows
+
+The SDK deliberately ships two ways to sequence model work — pick by who owns the ordering:
+
+- **The agent loop** — the model picks the next step every turn. Open-ended, bounded by `maxSteps`/`limits`/permissions. Most agents use this.
+- **Flows** (`FlowBuilder`/`FlowExecutor`) — the harness owns the order; the model only fills `llmCall` nodes. Phase pipelines and "the order is the contract" work use this. Why both exist: [flow vs. loop](/design/flow-vs-loop).
 
 ## What hangs off the loop
 
@@ -37,17 +59,14 @@ Three properties fall out of this shape and explain most of the codebase:
 | Sessions | Multi-turn transcript, forking, pending-turn resume | [sessions](/state/sessions) |
 | Storage | Sessions/checkpoints/approvals/tokens behind `AgentStore` | [storage stores](/state/storage-stores) |
 | Memory + compaction | Scoped recall into the prompt; two-stage context pruning | [memory](/state/memory), [compaction](/state/compaction) |
-| Tools | `defineTool`, registry, workspace/fs/shell, hosted, MCP, OpenAPI, tool search, code mode | [tool system](/tools/tool-system) |
-| Composition | `task` sub-agents, `handoff`, FlowBuilder pipelines, skills, agent dirs, `.claude/` loader | [composition](/compose/subagents) |
-| Interfaces | routeHandler + SSE, UI bindings, channels, triggers, schedules, ACP, auth, OAuth | [interfaces](/interfaces/server-and-routes) |
+| Tools | `defineTool`, registry, workspace, hosted, MCP, OpenAPI, tool search, code mode | [tool system](/tools/tool-system) |
+| Composition | `task` sub-agents, `handoff`, flows, skills, agent dirs, `.claude/` loader | [compose](/compose/subagents) |
+| Interfaces | routeHandler + SSE, UI bindings, channels, triggers, schedules, ACP, auth, OAuth | [server](/interfaces/server-and-routes) |
 | Ship | `lousho` CLI, node-server/docker/worker builds, spec files, registry kits | [build targets](/ship/build-targets) |
 | Typed decisions | `decide()` — the OpenAI Decisions API fast path for classify/route/score | [decisions](/providers/decisions) |
 
-## The two control flows
+## Three properties that explain the codebase
 
-The SDK deliberately ships **two** ways to sequence model work:
-
-- **The agent loop** — model decides the next step each turn. Open-ended, bounded by `maxSteps`/`limits`/permissions.
-- **Flows** (`FlowBuilder`/`FlowExecutor`) — the harness decides the order deterministically; the model fills `llmCall` nodes; `oneOf` branches on safe expressions. Used for phase pipelines and any "order must be guaranteed" work.
-
-Why both exist is its own page: [flow vs. loop](/design/flow-vs-loop).
+- **Durability is structural, not optional.** Every step checkpoints into `AgentStore`. A paused approval is a stored fact, not an in-memory wait. → [durable execution](/core/durable-execution)
+- **The model surface is swappable.** The loop only sees the shared generate/stream contract; provider specs resolve through `src/providers/`. → [provider architecture](/providers/architecture)
+- **Everything observable is an event.** Runs emit versioned JSON events feeding SSE, UI bindings, the session client and traces — there is no separate "what happened" channel. → [streaming events](/core/streaming-events)

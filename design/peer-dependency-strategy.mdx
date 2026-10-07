@@ -11,7 +11,7 @@ description: "Technical design: 16 peerDependencies (14 optional), none loaded a
 
 ## Rationale
 
-`@lousho/build-ai-agent` supports OpenAI, Anthropic, OpenRouter, Ollama, MCP, Docker sandboxes, QuickJS, React/Vue — but any one consumer uses a fraction. Paying the install/bundle/audit cost for unused providers is a tax on every `npm install`.
+`@lousho/build-ai-agent` supports OpenAI, Anthropic, OpenRouter, Ollama, MCP, Docker sandboxes, QuickJS, React/Vue — but any one consumer uses a fraction. Think of it as pay-for-what-you-plug-in: the SDK ships the sockets, not the appliances. You buy the drill only when you need to drill — paying the install, bundle and audit cost for every unused provider is a tax on every `npm install`.
 
 ## Problem Statement
 
@@ -19,7 +19,7 @@ How does the SDK ship support for many heavy integrations without forcing every 
 
 ## Business Value
 
-Install footprint stays minimal; adding a provider doesn't grow everyone's tree. The peer matrix (`ai` 4–7 × zod 3–4) lets the SDK ride ecosystem upgrades instead of pinning consumers.
+Install footprint stays minimal; adding a provider doesn't grow everyone's tree. The peer matrix (`ai` 4 / 6 / 7 × zod 3 / 4) lets the SDK ride ecosystem upgrades instead of pinning consumers to one version.
 
 # Goal
 
@@ -37,6 +37,7 @@ Zero optional peers load at import time; a missing one surfaces at first *use* a
 ## This project is for
 
 - The 14 optional peers (provider + feature packages) and the two required peers (`ai`, zod); compat layers for both; the import-time laziness contract; worker `node:` shims.
+- The `ai`-major-aware install hints — `peerInstallCommand` picks the peer version that pairs with the installed `ai` (`AI_RANGES`, `findPeerPairing`).
 
 ## This project is not for
 
@@ -47,6 +48,17 @@ Zero optional peers load at import time; a missing one surfaces at first *use* a
 # Solution
 
 `loadOptionalPeer` wraps a literal dynamic `import()` — module scope never holds one — and translates `MODULE_NOT_FOUND`/`ERR_MODULE_NOT_FOUND` into `MissingPeerDependencyError` whose `installCommand` is ai-major-aware (`@ai-sdk/openai@^0.0.42` on ai 4, `^4.0.0` on ai 7). `lazyValue` caches success, never failure, so installing-then-retrying works. `aiSdkCompat` maps the v4↔v6/v7 request/response/stream shapes (`aiMajorOf` sniffs *exports*: `stepCountIs` ⇒ v5+, `registerTelemetry` ⇒ v7). `zodCompat` compiles against `zod/v4/core` which exists in both zod majors. For Workers, `workerNodeShimPlugin` rewrites `node:*` only for a fixed importer allowlist and a post-build leak check fails the bundle if anything else reaches `node:`.
+
+## The picture
+
+```mermaid
+flowchart TD
+    I["import '@lousho/build-ai-agent'"] --> B["no optional peer is loaded"]
+    U["first real use, e.g. provider.generate()"] --> L["lazyValue wraps loadOptionalPeer around a literal import('@ai-sdk/openai')"]
+    L --> Q{"package installed?"}
+    Q -->|"yes"| OK["build provider, cache the promise"]
+    Q -->|"no"| ER["MissingPeerDependencyError: LOUSHO_PEER_MISSING + exact npm install line for your ai major"]
+```
 
 # Other Solutions
 
@@ -59,6 +71,7 @@ Zero optional peers load at import time; a missing one surfaces at first *use* a
 - Dynamic `import()` needs a literal specifier (bundlers must keep it external) — no variable package names.
 - Missing peers surface at first *use*, not `npm install` — `dockerode` is discovered when `SubprocessSandbox` first runs; `lousho doctor` and the error's install line mitigate.
 - Compat types are `never`-shaped at the boundary (`AiSdkModule` uses `options: never`).
+- `lazyValue` shares one in-flight promise across concurrent first uses, so a cold start triggers a single import.
 
 # Implementation considerations
 

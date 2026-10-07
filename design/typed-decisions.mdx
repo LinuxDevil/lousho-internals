@@ -11,7 +11,7 @@ Two surfaces: `createAgent({ output })` — a model turn constrained to a zod sc
 
 ## Rationale
 
-Some workflow steps shouldn't generate prose — they should *decide*: classify, route, score, verify. The TypeSafe Jev pattern makes this a typed probabilistic decision: unstructured state in, `{action, confidence}` out, workflow branches on it. A prose reply can't gate a branch; a validated schema field can.
+Some workflow steps shouldn't generate prose — they should *decide*: classify, route, score, verify. It's the difference between asking someone to write you an essay and handing them a multiple-choice form: the TypeSafe Jev pattern makes each step a typed probabilistic decision — unstructured state in, `{action, confidence}` out, and the workflow branches on it. A prose reply can't gate a branch; a validated schema field can.
 
 ## Problem Statement
 
@@ -29,14 +29,15 @@ Two interchangeable implementations of the same pattern: `output`-schema (any pr
 
 ### Secondary Goals
 
-- `decide()` supports all four question types (`predicate`/`choice`/`score`/`refusal`) with calibrated `probabilities`/`confidence`.
+- `decide()` supports the three question types (`predicate`/`choice`/`score`) with calibrated `probabilities`/`confidence`; `refusal` is a fourth *answer* shape, not a question.
 - Batch independent questions into one request (the API's shape), validated client-side.
 
 # Scope
 
 ## This project is for
 
-- Classify/route/score steps where a typed answer — not prose — is the deliverable; confidence-gated escalation.
+- Classify/route/score steps where a typed answer — not prose — is the deliverable.
+- Confidence-gated escalation: below the floor, the workflow takes the safe path or asks a human.
 
 ## This project is not for
 
@@ -46,6 +47,20 @@ Two interchangeable implementations of the same pattern: `output`-schema (any pr
 # Solution
 
 The `output` route: `createAgent({ output: z.object({action, confidence, reason}) })` → validated `result.object` → flow `oneOf` on `d.action` + `d.confidence >= floor`; below-floor escalates to the safe path. The `decide()` route: one `POST /decisions` with `{input, questions[]}` → `answers[]` mirroring question `name`s — predicate → `probability`, choice → `choice` + `probabilities` + `confidence`, score → weighted index, refusal → `{type:'refusal'}`. Response is zod-validated; errors map to standard `LOUSHO_*` codes.
+
+## The picture
+
+```mermaid
+flowchart LR
+    I["input: shared evidence"] --> Q["questions[]: predicate / choice / score"]
+    Q --> D["decide() sends POST {baseURL}/decisions"]
+    D --> A["answers[] echo the question names"]
+    A --> C{"confidence >= floor?"}
+    C -->|"yes"| R["dispatch the typed route"]
+    C -->|"no, or refusal"| H["escalate to a human"]
+```
+
+The endpoint returns a distribution, not a paragraph — the caller picks the branch; the model only supplies the confidence.
 
 # Other Solutions
 

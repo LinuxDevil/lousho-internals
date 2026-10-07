@@ -3,13 +3,41 @@ title: "Repo map"
 description: "Where every subsystem lives in agent-sdk — the src/ tree, the subpath exports, and the supporting directories."
 ---
 
-~450 non-test TypeScript files under `src/`, organised by subsystem. Tests sit next to sources (`*.test.ts`, `*.test-d.ts` for type tests, `*.live.test.ts` for real-provider runs, `*.replay.test.ts` for cassette replay).
+## What this is
 
-## `src/` — the SDK
+The repo is ~450 non-test TypeScript files under `src/`, organised so each subsystem owns a directory. Learning the map first means every later page's "Entry points" table lands somewhere you recognise. Think of it as a building's floor plan — the machinery pages are the room tours.
+
+## The `src/` tree at a glance
+
+```mermaid
+flowchart TD
+    subgraph runtime["the runtime"]
+        execution["execution/ — run loop, gate, checkpoints"]
+        session["session/ — transcript, fork, resume"]
+        storage["storage/ — AgentStore impls"]
+        memory["memory/ — slots, recall hooks"]
+        context["context/ — prompt assembly"]
+    end
+    subgraph models["models and tools"]
+        providers["providers/ — model adapters"]
+        decisions["decisions/ — decide()"]
+        tools["tools/ — registry, workspace, mcp, openapi"]
+    end
+    subgraph compose["composition and surfaces"]
+        subagents["subagents/ + handoffs + flows + skills + agentDir + claude/"]
+        server["server/ + react/vue/svelte + channels + triggers + auth + acp"]
+        ship["cli/ + deploy/ + spec/"]
+    end
+    runtime --> models --> compose
+```
+
+Tests sit next to sources: `*.test.ts` units, `*.test-d.ts` type tests, `*.live.test.ts` real-provider runs, `*.replay.test.ts` cassette replays.
+
+## Directory by directory
 
 | Directory | Subsystem | Internals page |
 |---|---|---|
-| `execution/` | Run loop, events, approvals, hooks, permissions, checkpoints, budgets, code-mode isolate | [core/](/core/execution-loop) |
+| `execution/` | Run loop, events, approvals, hooks, permissions, checkpoints, budgets, code-mode isolate | [the run loop](/core/execution-loop) |
 | `session/` | AgentSession, transcript/fork/pending-turn resume | [sessions](/state/sessions) |
 | `storage/` | AgentStore contract, file/sqlite stores | [stores](/state/storage-stores) |
 | `memory/` | defineMemory slots, remember/recall tools | [memory](/state/memory) |
@@ -17,7 +45,7 @@ description: "Where every subsystem lives in agent-sdk — the src/ tree, the su
 | `providers/` | Provider abstraction, ai-SDK compat, pi, reasoning, mock | [providers](/providers/architecture) |
 | `decisions/` | `decide()` — OpenAI Decisions API client | [decisions](/providers/decisions) |
 | `tools/` | defineTool, ToolRegistry, built-ins, workspace, hosted, mcp/, openapi/ | [tools](/tools/tool-system) |
-| `subagents/` | task tool, background tasks, remote/pi sub-agents | [subagents](/compose/subagents) |
+| `subagents/` | task tool, background tasks, remote/pi sub-agents | [sub-agents](/compose/subagents) |
 | `handoffAgents.ts`, `handoffs.ts` | Conversation transfer | [handoffs](/compose/handoffs) |
 | `flows/` | FlowBuilder, FlowExecutor, safeExpression | [flows](/compose/flows) |
 | `skills/` | SKILL.md loading | [skills](/compose/skills) |
@@ -35,7 +63,7 @@ description: "Where every subsystem lives in agent-sdk — the src/ tree, the su
 | `evals/` `testing/` `traces/` | eval harness, mockModel, OTel | [quality](/quality/testing-mock-model) |
 | `utils/` | SDKError, error codes, branding, validators | [errors](/core/errors) |
 
-## Package layout
+## The rest of the repo
 
 | Path | Role |
 |---|---|

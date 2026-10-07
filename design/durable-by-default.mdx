@@ -5,17 +5,17 @@ description: "Technical design: sessions, checkpoints and approvals are store-ba
 
 # Entry Point
 
-The `store` option on `createAgent({ store })` — one `AgentStore` (`src/storage/agentStore.ts`) bundling four contracts: `SessionStore` for transcripts, `CheckpointStore` for run progress, `ApprovalStore` for paused approvals, `OAuthTokenStore` for tokens. Implementations: `memoryStore()` (default), `fileStore()`, `SqliteStore` (`src/storage/`), `KVStore`/`kvCheckpointStore` for Workers (`src/deploy/`). Inside a run, `src/execution/checkpoint.ts` writes a `Checkpoint` after every tool-requesting model response, after every tool result, and on abort/pause/finish. Resume entry: `agent.resume(sessionId)` → `src/execution/resume.ts` → `resumeAfterApproval()`.
+The `store` option on `createAgent({ store })` — one `AgentStore` (`src/storage/agentStore.ts`) bundling four contracts: `SessionStore` for transcripts, `CheckpointStore` for run progress, `ApprovalStore` for paused approvals, `OAuthTokenStore` for tokens. Implementations: `memoryStore()` (in-memory), `fileStore()`, `SqliteStore` (`src/storage/`), `KVStore`/`kvCheckpointStore` for Workers (`src/deploy/`). Parts left out default to in-memory transcripts and approvals and *no* checkpoints — durability starts when you pass a store. Inside a run, `src/execution/checkpoint.ts` writes a `Checkpoint` after every tool-requesting model response, after every tool result, and on abort/pause/finish. Resume entry: `agent.resume(sessionId)` → `src/execution/resume.ts` → `resumeAfterApproval()`.
 
 # Background
 
 ## Rationale
 
-Agents pause for humans — a human approval can legitimately take *days*. If a pause is an in-memory wait, the process dying silently turns "waiting for approval" into "lost the run". Durability is a correctness property of the pause, not a convenience.
+Agents pause for humans — and a human approval can legitimately take *days*. If a pause is just a promise sitting in memory, a deploy or crash in between silently turns "waiting for approval" into "lost the run". Think of it like a save file in a game: without one, switching off the console erases everything since the last level. Durability is a correctness property of the pause, not a convenience.
 
 ## Problem Statement
 
-The run loop needs its full state — transcript, `stepIndex`, `usage`, `businessState`, `status`, `approvalId`, `agentFingerprint`, `runConfig`, `principal`, `metadata` — to survive process death and be reloadable by a *different* process days later, so an approval resolved over HTTP can continue the exact run that produced it.
+For a pause to survive, the run's full working state — transcript, `stepIndex`, `usage`, `businessState`, `status`, `approvalId`, `agentFingerprint`, `runConfig`, `principal`, `metadata` — has to live outside the process and be reloadable by a *different* process days later, so an approval resolved over HTTP can continue the exact run that produced it.
 
 ## Business Value
 
@@ -36,7 +36,7 @@ A run paused for approval — or crashed mid-batch — resumes correctly from a 
 
 ## This project is for
 
-- Run pause/resume across processes and restarts; crash recovery to the last committed step; durable approvals; per-session checkpoint history rings.
+- Resuming runs across processes and restarts; recovering a crashed run to its last committed step; approvals that outlive the process; a bounded history of past checkpoints per session.
 
 ## This project is not for
 
@@ -47,6 +47,25 @@ A run paused for approval — or crashed mid-batch — resumes correctly from a 
 # Solution
 
 Checkpoints commit at fixed points in the loop: after a model response requesting tools, after each recorded tool result, on abort/pause/finish (`checkpoint.ts`). Ordering matters at the pause boundary: the **approval record is written first, the checkpoint second** — a reader that sees the checkpoint can always find the approval ([approvals](/core/approvals)). Approvals are *claim-on-read* (`wx` claim files, `resolved_at` transactions, KV get+delete) so two processes can't both resolve one. `resumeAfterApproval()` deletes the stale pre-pause checkpoint before re-entering `execute()` so resumption can't rehydrate it (LOU-K5). A caller stumbling onto a paused session gets `SessionAwaitingApprovalError` carrying `sessionId`/`approvalId`/`approvalKind` (`src/execution/errors.ts`).
+
+## The picture
+
+```mermaid
+sequenceDiagram
+    participant U as "your code"
+    participant E as "AgentExecutor"
+    participant S as "AgentStore"
+    participant H as "human approver"
+    U->>E: agent.send(msg, sessionId)
+    E->>S: checkpoint after each model reply / tool result
+    E->>S: save approval record (first)
+    E->>S: save 'awaiting-approval' checkpoint (second)
+    Note over E,S: the process may die here - days may pass
+    H->>S: resolve the approval (any process, exactly once)
+    U->>E: agent.resume(sessionId)
+    E->>S: delete stale checkpoint, load approval
+    E-->>U: run continues from the paused tool call
+```
 
 # Other Solutions
 

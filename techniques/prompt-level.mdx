@@ -3,15 +3,33 @@ title: "Prompt-level techniques"
 description: "Every single-call technique — few-shot, CoT, personas, delimiters — and why they all reduce to instructions, seeded turns, and output schemas."
 ---
 
-## How they work
+## What this is
 
-A prompt-level technique changes one thing: the text and message shape a single model call sees. In the SDK that's three injection points, all resolved during [context assembly](/state/context-assembly):
+A prompt-level technique changes exactly one thing: the text and message shape a *single* model call sees. Few-shot examples, chain-of-thought nudges, personas, delimiters — none of them add machinery; they rewrite the ask. The analogy is a work order: you can word it better, staple on examples of "done", or demand the answer on a form — but it's still one worker reading one sheet. The moment a technique needs a second call, a retry, or a check, it has left this layer.
 
-- `createAgent({ instructions, prompt })` — the persistent ask
-- seeded `session.send()` turns — a scripted user/assistant exchange the real turn continues (few-shot without polluting `instructions`)
-- `output: schema` — the ask becomes a typed contract, enforced by [structured output](/providers/structured-output)
+## The mental model
 
-## The catalog → the mechanism
+Three injection points feed one call, and one of them also constrains what comes back:
+
+```mermaid
+flowchart LR
+    I["instructions / prompt"] --> C["one model call"]
+    S["seeded turns"] --> C
+    O["output schema"] --> C
+    C --> R["text or validated object"]
+```
+
+Nouns to hold: the **ask** (`instructions`, persistent), the **scripted history** (seeded turns — few-shot as fake prior messages), and the **contract** (`output`, a schema the reply is validated against).
+
+## How it maps to Lousho
+
+In the SDK the sheet has three places to write on, all resolved during [context assembly](/state/context-assembly):
+
+- `createAgent({ instructions, prompt })` — the persistent ask.
+- seeded `session.send()` turns — `send()` accepts a `Message[]` passed through as-is, so a scripted user/assistant exchange can sit in front of the real turn (few-shot without polluting `instructions`).
+- `output: schema` — the ask becomes a typed contract, enforced by [structured output](/providers/structured-output).
+
+The catalog, mapped:
 
 | Technique | Mechanism in Lousho |
 |---|---|
@@ -28,11 +46,17 @@ A prompt-level technique changes one thing: the text and message shape a single 
 | Scratchpad | A memory slot, a workspace file, or `.claude/scratchpad/` via `claudeProject()` |
 | Structured output | `output: zodSchema` — validated, typed, one repair retry |
 
-## Design decisions
+Read the table's last column as an escape hatch: whenever a row needs more than text — order, retry, enforcement — the "mechanism" points out of this layer entirely. That is the page's point: *what not to solve in the prompt*.
 
-- **Prompted monologue is deprecated internally.** Chain-of-thought via instructions produces untraceable text; the `reasoning` option produces provider-native thinking blocks that are signed, retained across turns (`replaysReasoning`), and rendered as `reasoning` events.
-- **Self-consistency / tree-of-thoughts are not prompt techniques here.** Sampling N answers or exploring branches is a *workflow* — `parallel` flow nodes or `task` fan-out ([wave engineering](/techniques/wave-engineering)) — because the machinery (concurrency, aggregation) already exists.
-- **Enforcement never lives in the prompt.** "Never delete files" as text survives until a tool result talks the model out of it; `permissions: { rules: [...] }` survives forever.
+## Under the hood
+
+Why exactly three injection points: a model call only ever sees a system block plus a transcript, and every prompt-level lever lands in one or the other. `instructions`/`prompt` become the system message; seeded turns are just messages that happen to precede the real one (`send()`/`stream()` pass a `Message[]` through unchanged); `output` straddles both — [context assembly](/state/context-assembly) appends the output instruction *last* in the system prompt so nothing crowds it out, and the provider side validates the reply, allowing one repair step (counted against `maxSteps`) on a malformed result.
+
+`reasoning` earns its row in the catalog because provider-native thinking is *data*, not text: signed reasoning tokens are retained across turns (`replaysReasoning`) and surface as `reasoning` events, while a prompted "think step by step" produces ordinary text nobody downstream can verify or reuse.
+
+One subtlety the table hides: `instructions` doesn't have to be a string constant — like `model` and `tools` it can be a function of the run context, so `send()`'s `metadata` can vary the ask per turn without touching machinery.
+
+The layer also has a hard ceiling worth stating plainly: prompt techniques can change *what the model is likely to do* and nothing else. The moment correctness, order or a guarantee matters, the technique belongs to [context engineering](/techniques/context-engineering) or the [workflow layer](/techniques/agentic-patterns) — which is why so many catalog rows end in a link out.
 
 ## Example
 
@@ -49,6 +73,15 @@ const agent = createAgent({
   output: z.object({ issues: z.array(z.string()), verdict: z.enum(['ship', 'fix']) }),
 });
 ```
+
+One `instructions` block carries the persona, the few-shot pair and the style rules — that is the whole prompt layer. `output` does the other half: instead of *asking* for a verdict, it *requires* `{issues, verdict}`, validated, with one repair retry if the model answers in malformed JSON. Nothing here can stop the model from suggesting a test deletion in prose — only a permission rule could, and that lives in a different layer.
+
+## Design decisions
+
+- **Prompted monologue is deprecated internally.** Chain-of-thought via instructions produces untraceable text; the `reasoning` option produces provider-native thinking blocks that are signed, retained across turns (`replaysReasoning`) and rendered as `reasoning` events.
+- **Self-consistency / tree-of-thoughts are not prompt techniques here.** Sampling N answers or exploring branches is a *workflow* — `parallel` flow nodes or `task` fan-out ([wave engineering](/techniques/wave-engineering)) — because the machinery (concurrency, aggregation) already exists.
+- **Enforcement never lives in the prompt.** "Never delete files" as text survives until a tool result talks the model out of it; `permissions: { rules: [...] }` survives forever.
+- **Repair is bounded.** `output` gets exactly one repair step, counted against `maxSteps` — a schema the model can't satisfy fails the run instead of looping on retries.
 
 ## Where next
 

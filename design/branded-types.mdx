@@ -11,7 +11,7 @@ description: "Technical design: Symbol.for brands for cross-copy instanceof, uni
 
 ## Rationale
 
-The SDK ships dual CJS/ESM bundles, and a process can end up loading both (or two nested copies). TypeScript's structural typing and `instanceof` both fail there — two class identities for the same class. The SDK needs a way to recognize "an object I made" that survives duplicated copies.
+The SDK ships both CJS and ESM bundles, and one process can end up loading both (or two nested copies of the package). When that happens, each copy defines its own `class SDKError` — two different class identities for the same class — so TypeScript's structural typing and `instanceof` both fail. Think of a brand like a wax seal: two printing presses produce letters on different letterhead, but a seal pressed with a shared signet proves the letter came from us, whichever press made it. The SDK needs that kind of mark — a way to recognize "an object I made" that survives duplicated copies.
 
 ## Problem Statement
 
@@ -52,6 +52,18 @@ Five forms, chosen by who must share the mark:
 | `Symbol.for` on `globalThis` | process-wide | `lousho.providerInterceptor` — CJS and ESM bundles must see the same one |
 | Non-enumerable `Symbol.for` property | recognizable, hidden | `lousho.todoList` result brand → emits `todo.updated`; `JSON.stringify` never sees it |
 | `WeakSet`/`WeakMap` | membership | remote-agent products, handoff registrations — membership can't be faked by a lookalike |
+
+## The picture
+
+```mermaid
+flowchart TB
+    A["one process loads the SDK twice: CJS + ESM"] --> B["copy A defines class SDKError"]
+    A --> C["copy B defines class SDKError — a different identity"]
+    B --> D["every instance carries Symbol.for('lousho.SDKError') = true"]
+    C --> D
+    D --> E["instanceof SDKError: true in either copy"]
+    F["plain instanceof across copies"] --> G["false — silent misidentification"]
+```
 
 # Other Solutions
 
