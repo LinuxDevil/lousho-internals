@@ -13,16 +13,19 @@ Work top-to-bottom through the sections below. For each, the checklist is the ba
 - What's the difference between a run, a turn, a step, and a tool call? → [run lifecycle](/core/run-lifecycle)
 - What are the 20 subpath exports, and what goes on the root barrel vs. a subpath? → [repo map](/repo-map)
 
-## 2. Execution core
+## 2. The run loop
 
-- In what order does a tool call pass the gate (rules → hooks → needsApproval → mode)? Why is the permission-mode verdict applied *last*? → [approvals](/core/approvals), [permission modes](/core/permission-modes)
 - What exactly is checkpointed, and at which moments? Why does the turn checkpoint happen *before* tools run? → [durable execution](/core/durable-execution)
-- What pauses a run, and what does resuming actually re-enter? → [approvals](/core/approvals)
 - What's the event stream's versioning contract, and what consumes it? → [streaming events](/core/streaming-events)
-- What can each hook point do (veto, rewrite, observe)? → [hooks](/core/hooks)
 - How do `SDKError`, `LOUSHO_*` codes and `appendHelp` work — and why does the model never see the hint line? → [errors](/core/errors), [error codes ADR](/design/error-codes)
 
-## 3. Sessions and state
+## 3. Safety and control
+
+- In what order does a tool call pass the gate (rules → hooks → needsApproval → mode)? Why is the permission-mode verdict applied *last*? → [approvals](/core/approvals), [permission modes](/core/permission-modes)
+- What pauses a run, and what does resuming actually re-enter? → [approvals](/core/approvals)
+- What can each hook point do (veto, rewrite, observe)? → [hooks](/core/hooks)
+
+## 4. State and context
 
 - What does `AgentSession` own that the executor doesn't? What do `enqueue`/`steer`/`turnPolicy` do? → [sessions](/state/sessions)
 - What does `fork()` copy — and what's `providerValidPrefix` for? → [sessions](/state/sessions)
@@ -32,7 +35,7 @@ Work top-to-bottom through the sections below. For each, the checklist is the ba
 - Compaction's two stages, trigger point, and what happens when the summary is rejected → [compaction](/state/compaction)
 - What does `extendRunOptions` compose, in what order? → [context assembly](/state/context-assembly)
 
-## 4. Providers and models
+## 5. Providers and models
 
 - What's the `LLMProvider` contract? How does `'openai/gpt-4o-mini'` or `'pi/anthropic/…'` resolve? → [provider architecture](/providers/architecture), [model selection](/providers/model-selection)
 - How does the SDK support `ai` v4–v7 *and* zod 3/4 in one tree? → [ai-sdk compat](/providers/ai-sdk-compat)
@@ -40,7 +43,7 @@ Work top-to-bottom through the sections below. For each, the checklist is the ba
 - How is `output` schema enforced — and what's the one repair step? → [structured output](/providers/structured-output)
 - How do reasoning blocks survive into the next request? → [reasoning](/providers/reasoning)
 
-## 5. Tools
+## 6. Tools
 
 - The `defineTool` contract, `toolEntries` flattening, batch gate ordering → [tool system](/tools/tool-system)
 - How does workspace confinement actually work (lexical + realpath)? → [workspace tools](/tools/workspace-tools)
@@ -50,7 +53,7 @@ Work top-to-bottom through the sections below. For each, the checklist is the ba
 - How does tool search survive resume and reset on handoff? → [tool search](/tools/tool-search)
 - What is code mode's boundary (QuickJS isolate, JSON-only)? → [code mode](/tools/code-mode)
 
-## 6. Composition
+## 7. Compose agents
 
 - `task` calls, `BackgroundTasks` (maxConcurrent, `awaitBackgroundOnFinish`), remote/pi sub-agents → [sub-agents](/compose/subagents)
 - What a handoff does to `state.options`, `activeAgentOf`, `maxHandoffs` → [handoffs](/compose/handoffs)
@@ -59,7 +62,7 @@ Work top-to-bottom through the sections below. For each, the checklist is the ba
 - `loadAgentDir` vs `claudeProject()` — the trust-model difference → [agent directories](/compose/agent-directories), [claude projects](/compose/claude-projects)
 - The agentic patterns catalog and which machinery implements each → [techniques](/techniques/overview)
 
-## 7. Interfaces
+## 8. Interfaces
 
 - `routeHandler`'s route table and SSE framing → [server and routes](/interfaces/server-and-routes)
 - How `reduceAgentEvents` drives React/Vue/Svelte from one event stream → [ui bindings](/interfaces/ui-bindings)
@@ -69,7 +72,7 @@ Work top-to-bottom through the sections below. For each, the checklist is the ba
 - `routeAuth`'s ordered walk, principal threading → [auth](/interfaces/auth)
 - PKCE flow, sealed token store, `takeOwnPending` cross-user refusal → [oauth](/interfaces/oauth)
 
-## 8. Ship
+## 9. Ship and distribute
 
 - The `lousho` command dispatch and `dev`'s hot-swap → [cli](/ship/cli)
 - Adapter lifecycle, the virtual `deploy-runtime` specifier, worker `node:` constraints → [build targets](/ship/build-targets)
@@ -77,7 +80,7 @@ Work top-to-bottom through the sections below. For each, the checklist is the ba
 - `lousho add` install checks and receipt enforcement (ALS envelope) → [registry kits](/ship/registry-kits)
 - What `npm create lousho-agent` renders per template → [create-lousho-agent](/ship/create-lousho-agent)
 
-## 9. Quality machinery
+## 10. Quality gates
 
 - `mockModel` turn forms, `calls` inspection, `onExhausted` → [testing](/quality/testing-mock-model)
 - Cassette modes, fingerprinting, `CassetteMismatchError` → [record/replay](/quality/record-replay)
@@ -86,7 +89,7 @@ Work top-to-bottom through the sections below. For each, the checklist is the ba
 - How docs snippets are verified and llms.txt generated → [docs pipeline](/quality/docs-pipeline)
 - The CI gate order, peers matrix, and why CRAP needs fresh coverage → [api report + fallow](/quality/api-report-and-fallow)
 
-## 10. Design decisions and contributing
+## 11. Design decisions and contributing
 
 - All six ADRs: what was decided, what was rejected → [design](/design/durable-by-default)
 - The five-surface feature checklist → [adding a feature](/contribute/adding-a-feature)

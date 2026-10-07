@@ -19,7 +19,7 @@ Same material as the [study guide](/study-guide), minus the answers. Answer out 
   </Accordion>
 </AccordionGroup>
 
-## Execution core
+## Safety and control
 
 <AccordionGroup>
   <Accordion title="Order the tool-call gate.">
@@ -28,6 +28,11 @@ Same material as the [study guide](/study-guide), minus the answers. Answer out 
   <Accordion title="What does 'ask' actually do to the run?">
     `ApprovalGate` writes a durable approval, the run pauses with `finishReason: 'awaiting-approval'`; `resume()`/`resolveApproval` re-enters via `resumedHookCall`/`runApprovedToolCall` — surviving process restarts because the approval is stored state, not an in-memory wait. [Core](/core/approvals)
   </Accordion>
+</AccordionGroup>
+
+## Errors and identity
+
+<AccordionGroup>
   <Accordion title="Why does the model never see the 'hint (docs)' suffix on an SDKError?">
     Errors returned to the model are thrown with `appendHelp: false` — `message` stays clean; only user-facing errors append `[code] hint (docs/errors.md#anchor)`. [Design](/design/error-codes)
   </Accordion>
@@ -36,7 +41,7 @@ Same material as the [study guide](/study-guide), minus the answers. Answer out 
   </Accordion>
 </AccordionGroup>
 
-## Sessions and state
+## State and context
 
 <AccordionGroup>
   <Accordion title="What's in the AgentStore contract?">
@@ -84,7 +89,7 @@ Same material as the [study guide](/study-guide), minus the answers. Answer out 
   </Accordion>
 </AccordionGroup>
 
-## Composition
+## Compose agents
 
 <AccordionGroup>
   <Accordion title="What does transfer_to_<name> actually execute?">
@@ -115,7 +120,7 @@ Same material as the [study guide](/study-guide), minus the answers. Answer out 
   </Accordion>
 </AccordionGroup>
 
-## Quality and design
+## Quality gates and design
 
 <AccordionGroup>
   <Accordion title="CI's gate order?">

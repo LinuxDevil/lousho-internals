@@ -52,20 +52,25 @@
             ]
           },
           {
-            "group": "Execution core",
+            "group": "The run loop",
             "pages": [
               "core/execution-loop",
               "core/run-lifecycle",
               "core/streaming-events",
-              "core/approvals",
-              "core/permission-modes",
-              "core/hooks",
               "core/durable-execution",
               "core/errors"
             ]
           },
           {
-            "group": "Sessions and state",
+            "group": "Safety and control",
+            "pages": [
+              "core/approvals",
+              "core/permission-modes",
+              "core/hooks"
+            ]
+          },
+          {
+            "group": "State and context",
             "pages": [
               "state/sessions",
               "state/storage-stores",
@@ -81,9 +86,9 @@
               "providers/model-selection",
               "providers/ai-sdk-compat",
               "providers/pi",
-              "providers/decisions",
+              "providers/reasoning",
               "providers/structured-output",
-              "providers/reasoning"
+              "providers/decisions"
             ]
           },
           {
@@ -99,7 +104,7 @@
             ]
           },
           {
-            "group": "Composition",
+            "group": "Compose agents",
             "pages": [
               "compose/subagents",
               "compose/handoffs",
@@ -144,7 +149,7 @@
             ]
           },
           {
-            "group": "Quality machinery",
+            "group": "Quality gates",
             "pages": [
               "quality/testing-mock-model",
               "quality/record-replay",
